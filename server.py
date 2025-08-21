@@ -1,18 +1,30 @@
 import os, json, requests
-from fastapi import FastAPI
-from pydantic import BaseModel
 from typing import List, Dict
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 
+# -------- env --------
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-JINA_API_KEY = os.getenv("JINA_API_KEY")  # optional, for embeddings
+JINA_API_KEY = os.getenv("JINA_API_KEY")  # required for embeddings
+AUTO_SEED = os.getenv("AUTO_SEED", "1")   # "1" = seed on startup, "0" = skip
 
+# -------- clients/app --------
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 app = FastAPI()
 
-# ---------- models ----------
+# CORS so browser JS from your PythonAnywhere domain can call this directly if needed
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or set to ["https://<your-domain>.pythonanywhere.com"]
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------- models --------
 class UpsertItem(BaseModel):
     id: int
     vector: List[float]
@@ -30,7 +42,7 @@ class Intent(BaseModel):
 
 class SeedReq(BaseModel):
     collection: str
-    dim: int = 1024     # for jina-embeddings-v3
+    dim: int = 1024  # jina-embeddings-v3
     intents: List[Intent]
 
 class SmartSearchReq(BaseModel):
@@ -38,7 +50,7 @@ class SmartSearchReq(BaseModel):
     text: str
     limit: int = 3
 
-# ---------- helpers ----------
+# -------- helpers --------
 def embed_jina(texts: List[str]) -> List[List[float]]:
     if not JINA_API_KEY:
         raise RuntimeError("JINA_API_KEY not set on server")
@@ -46,15 +58,47 @@ def embed_jina(texts: List[str]) -> List[List[float]]:
         "https://api.jina.ai/v1/embeddings",
         headers={"Authorization": f"Bearer {JINA_API_KEY}",
                  "Content-Type": "application/json"},
-        data=json.dumps({"model": "jina-embeddings-v3",
-                         "input": texts,
-                         "encoding_format": "float"}),
+        data=json.dumps({
+            "model": "jina-embeddings-v3",
+            "input": texts,
+            "encoding_format": "float"
+        }),
         timeout=30
     )
     r.raise_for_status()
     return [d["embedding"] for d in r.json()["data"]]
 
-# ---------- endpoints ----------
+def upsert_intents(collection: str, dim: int, intents: List[Dict]):
+    # (re)create collection
+    client.recreate_collection(
+        collection_name=collection,
+        vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
+    )
+    # flatten phrases
+    items, texts = [], []
+    for intent in intents:
+        for phrase in intent["phrases"]:
+            items.append({
+                "name": intent["name"],
+                "route": intent["route"],
+                "role": intent.get("role", "any"),
+                "text": phrase
+            })
+            texts.append(phrase)
+    # embed and upsert
+    vecs = embed_jina(texts)
+    points = [
+        qm.PointStruct(
+            id=i + 1,
+            vector=vecs[i],
+            payload=items[i],
+        )
+        for i in range(len(items))
+    ]
+    client.upsert(collection, points=points)
+    return len(points)
+
+# -------- endpoints --------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -63,7 +107,7 @@ def health():
 def recreate(collection: str, dim: int, distance: str = "COSINE"):
     client.recreate_collection(
         collection_name=collection,
-        vectors_config=qm.VectorParams(size=dim, distance=getattr(qm.Distance, distance))
+        vectors_config=qm.VectorParams(size=dim, distance=getattr(qm.Distance, distance)),
     )
     return {"ok": True}
 
@@ -75,41 +119,61 @@ def upsert(collection: str, items: List[UpsertItem]):
 
 @app.post("/search/{collection}")
 def search(collection: str, req: SearchReq):
-    hits = client.search(collection_name=collection, query_vector=req.vector,
-                         limit=req.limit, with_payload=True)
+    hits = client.search(
+        collection_name=collection, query_vector=req.vector, limit=req.limit, with_payload=True
+    )
     return [{"score": float(h.score), "payload": h.payload} for h in hits]
 
 @app.post("/seed")
 def seed(req: SeedReq):
-    # (re)create collection with right dim
-    client.recreate_collection(
-        collection_name=req.collection,
-        vectors_config=qm.VectorParams(size=req.dim, distance=qm.Distance.COSINE),
-    )
-    # flatten phrases and embed
-    items, texts = [], []
-    for intent in req.intents:
-        for phrase in intent.phrases:
-            items.append({"name": intent.name, "route": intent.route,
-                          "role": intent.role, "text": phrase})
-            texts.append(phrase)
-    vecs = embed_jina(texts)
-    # upsert
-    points = [
-        qm.PointStruct(
-            id=i+1,
-            vector=vecs[i],
-            payload={"name": itm["name"], "route": itm["route"],
-                     "role": itm["role"], "text": itm["text"]}
-        )
-        for i, itm in enumerate(items)
-    ]
-    client.upsert(req.collection, points=points)
-    return {"ok": True, "count": len(points)}
+    count = upsert_intents(req.collection, req.dim, [i.dict() for i in req.intents])
+    return {"ok": True, "count": count}
 
 @app.post("/smart_search")
 def smart_search(req: SmartSearchReq):
     vec = embed_jina([req.text])[0]
-    hits = client.search(collection_name=req.collection, query_vector=vec,
-                         limit=req.limit, with_payload=True)
+    hits = client.search(
+        collection_name=req.collection, query_vector=vec, limit=req.limit, with_payload=True
+    )
     return [{"score": float(h.score), "payload": h.payload} for h in hits]
+
+# -------- auto-seed on startup --------
+@app.on_event("startup")
+def startup_seed():
+    if AUTO_SEED != "1":
+        return
+    # Put your initial intents here; change/expand anytime and redeploy to refresh.
+    intents = [
+        {
+            "name": "Pending Orders",
+            "route": "/custneworders?tab=pending",
+            "role": "customer",
+            "phrases": [
+                "show my pending orders",
+                "what orders are still waiting",
+                "orders not accepted yet",
+                "pending customer orders"
+            ],
+        },
+        {
+            "name": "Accepted Orders",
+            "route": "/custneworders?tab=accepted",
+            "role": "customer",
+            "phrases": [
+                "which orders got accepted",
+                "show accepted orders",
+                "orders that shops accepted"
+            ],
+        },
+        {
+            "name": "New Orders (Shop)",
+            "route": "/shopneworders",
+            "role": "shop",
+            "phrases": [
+                "show new customer orders",
+                "what new orders are available",
+                "orders I can accept"
+            ],
+        },
+    ]
+    upsert_intents("ai_actions_v1", 1024, intents)
