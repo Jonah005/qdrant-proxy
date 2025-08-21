@@ -19,7 +19,7 @@ app = FastAPI()
 # allow browser calls from your site
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://smbshopper1.pythonanywhere.com"],   # or restrict to ["https://<your-domain>.pythonanywhere.com"]
+    allow_origins=["https://smbshopper1.pythonanywhere.com", "https://www.smbshopper1.pythonanywhere.com"],   # or restrict to ["https://<your-domain>.pythonanywhere.com"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
