@@ -6,21 +6,25 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 
+# -------- env --------
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 JINA_API_KEY = os.getenv("JINA_API_KEY")
 AUTO_SEED = os.getenv("AUTO_SEED", "1")  # "1" = seed on startup
 
+# -------- clients/app --------
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 app = FastAPI()
 
+# allow browser calls from your site
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or restrict to your PA domain
+    allow_origins=["*"],   # or restrict to ["https://<your-domain>.pythonanywhere.com"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -------- models --------
 class UpsertItem(BaseModel):
     id: int
     vector: List[float]
@@ -46,26 +50,50 @@ class SmartSearchReq(BaseModel):
     text: str
     limit: int = 3
 
+# -------- helpers --------
 def embed_jina(texts: List[str]) -> List[List[float]]:
+    """Embed with Jina; try OpenAI-style payload first, then fallback to object-style on 422."""
     if not JINA_API_KEY:
         raise RuntimeError("JINA_API_KEY not set on server")
-    r = requests.post(
-        "https://api.jina.ai/v1/embeddings",
-        headers={"Authorization": f"Bearer {JINA_API_KEY}",
-                 "Content-Type": "application/json"},
-        data=json.dumps({"model": "jina-embeddings-v3",
-                         "input": texts,
-                         "encoding_format": "float"}),
-        timeout=30
-    )
+
+    headers = {"Authorization": f"Bearer {JINA_API_KEY}", "Content-Type": "application/json"}
+
+    # Try OpenAI-style
+    payload1 = {"model": "jina-embeddings-v3", "input": texts, "encoding_format": "float"}
+    r = requests.post("https://api.jina.ai/v1/embeddings", headers=headers, json=payload1, timeout=30)
+    if r.status_code == 200:
+        data = r.json()
+        return [d["embedding"] for d in data["data"]]
+
+    # Fallback on 422: object-style { "text": ... }
+    if r.status_code == 422:
+        payload2 = {
+            "model": "jina-embeddings-v3",
+            "input": [{"text": t} for t in texts],
+            "encoding_format": "float",
+        }
+        r2 = requests.post("https://api.jina.ai/v1/embeddings", headers=headers, json=payload2, timeout=30)
+        try:
+            r2.raise_for_status()
+        except requests.HTTPError:
+            # Log body for debugging in Render logs then re-raise
+            print("Jina 422 fallback error:", r2.status_code, r2.text)
+            raise
+        data = r2.json()
+        return [d["embedding"] for d in data["data"]]
+
+    # Any other error: log body and raise
+    print("Jina error:", r.status_code, r.text)
     r.raise_for_status()
-    return [d["embedding"] for d in r.json()["data"]]
+    return []  # unreachable, but keeps type checker happy
 
 def upsert_intents(collection: str, dim: int, intents: List[Dict]):
+    # (re)create collection
     client.recreate_collection(
         collection_name=collection,
         vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
     )
+    # flatten phrases
     items, texts = [], []
     for intent in intents:
         for phrase in intent["phrases"]:
@@ -76,17 +104,22 @@ def upsert_intents(collection: str, dim: int, intents: List[Dict]):
                 "text": phrase
             })
             texts.append(phrase)
+    # embed + upsert
     vecs = embed_jina(texts)
-    points = [
-        qm.PointStruct(id=i+1, vector=vecs[i], payload=items[i])
-        for i in range(len(items))
-    ]
+    points = [qm.PointStruct(id=i+1, vector=vecs[i], payload=items[i]) for i in range(len(items))]
     client.upsert(collection, points=points)
     return len(points)
 
+# -------- endpoints --------
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/debug_embed")
+def debug_embed():
+    # quick sanity check: returns embedding length (should be 1024)
+    vec = embed_jina(["hello world"])[0]
+    return {"ok": True, "dim": len(vec)}
 
 @app.post("/recreate/{collection}")
 def recreate(collection: str, dim: int, distance: str = "COSINE"):
@@ -120,6 +153,7 @@ def smart_search(req: SmartSearchReq):
                          limit=req.limit, with_payload=True)
     return [{"score": float(h.score), "payload": h.payload} for h in hits]
 
+# -------- auto-seed on startup --------
 @app.on_event("startup")
 def startup_seed():
     if AUTO_SEED != "1":
