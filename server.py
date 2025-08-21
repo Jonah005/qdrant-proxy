@@ -52,40 +52,47 @@ class SmartSearchReq(BaseModel):
 
 # -------- helpers --------
 def embed_jina(texts: List[str]) -> List[List[float]]:
-    """Embed with Jina; try OpenAI-style payload first, then fallback to object-style on 422."""
+    """Embed with Jina; minimal payload to avoid 422 'Extra inputs are not permitted'."""
     if not JINA_API_KEY:
         raise RuntimeError("JINA_API_KEY not set on server")
 
-    headers = {"Authorization": f"Bearer {JINA_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {JINA_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    # Try OpenAI-style
-    payload1 = {"model": "jina-embeddings-v3", "input": texts, "encoding_format": "float"}
-    r = requests.post("https://api.jina.ai/v1/embeddings", headers=headers, json=payload1, timeout=30)
+    # Try OpenAI-style: {"model": "...", "input": ["a", "b", ...]}
+    payload1 = {"model": "jina-embeddings-v3", "input": texts}
+    r = requests.post(
+        "https://api.jina.ai/v1/embeddings",
+        headers=headers,
+        json=payload1,
+        timeout=30,
+    )
     if r.status_code == 200:
         data = r.json()
         return [d["embedding"] for d in data["data"]]
 
-    # Fallback on 422: object-style { "text": ... }
+    # If schema-complaint still fails (422 etc.), try object-style: {"input":[{"text":"..."}]}
     if r.status_code == 422:
-        payload2 = {
-            "model": "jina-embeddings-v3",
-            "input": [{"text": t} for t in texts],
-            "encoding_format": "float",
-        }
-        r2 = requests.post("https://api.jina.ai/v1/embeddings", headers=headers, json=payload2, timeout=30)
+        payload2 = {"model": "jina-embeddings-v3", "input": [{"text": t} for t in texts]}
+        r2 = requests.post(
+            "https://api.jina.ai/v1/embeddings",
+            headers=headers,
+            json=payload2,
+            timeout=30,
+        )
         try:
             r2.raise_for_status()
         except requests.HTTPError:
-            # Log body for debugging in Render logs then re-raise
-            print("Jina 422 fallback error:", r2.status_code, r2.text)
+            print("Jina 422 payload2 error:", r2.status_code, r2.text)
             raise
         data = r2.json()
         return [d["embedding"] for d in data["data"]]
 
-    # Any other error: log body and raise
+    # Log other errors verbosely for Render logs
     print("Jina error:", r.status_code, r.text)
     r.raise_for_status()
-    return []  # unreachable, but keeps type checker happy
 
 def upsert_intents(collection: str, dim: int, intents: List[Dict]):
     # (re)create collection
