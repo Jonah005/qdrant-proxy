@@ -1,6 +1,6 @@
 import os, json, requests
 from typing import List, Dict
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
@@ -19,7 +19,7 @@ app = FastAPI()
 # allow browser calls from your site
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://smbshopper1.pythonanywhere.com", "https://www.smbshopper1.pythonanywhere.com"],   # or restrict to ["https://<your-domain>.pythonanywhere.com"]
+    allow_origins=["https://smbshopper1.pythonanywhere.com", "https://www.smbshopper1.pythonanywhere.com"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -73,7 +73,7 @@ def embed_jina(texts: List[str]) -> List[List[float]]:
         data = r.json()
         return [d["embedding"] for d in data["data"]]
 
-    # If schema-complaint still fails (422 etc.), try object-style: {"input":[{"text":"..."}]}
+    # If schema-compliant still fails (422 etc.), try object-style: {"input":[{"text":"..."}]}
     if r.status_code == 422:
         payload2 = {"model": "jina-embeddings-v3", "input": [{"text": t} for t in texts]}
         r2 = requests.post(
@@ -82,11 +82,7 @@ def embed_jina(texts: List[str]) -> List[List[float]]:
             json=payload2,
             timeout=30,
         )
-        try:
-            r2.raise_for_status()
-        except requests.HTTPError:
-            print("Jina 422 payload2 error:", r2.status_code, r2.text)
-            raise
+        r2.raise_for_status()
         data = r2.json()
         return [d["embedding"] for d in data["data"]]
 
@@ -128,6 +124,46 @@ def debug_embed():
     vec = embed_jina(["hello world"])[0]
     return {"ok": True, "dim": len(vec)}
 
+# ---------- DEBUG: raw embedding endpoints ----------
+@app.post("/embed_text")
+def embed_text(body: Dict[str, str]):
+    """
+    Return the raw embedding for a given text (POST).
+    Body: { "text": "..." }
+    """
+    text = (body or {}).get("text", "").strip()
+    if not text:
+        return {"error": "missing 'text'"}
+    vec = embed_jina([text])[0]
+    return {
+        "ok": True,
+        "dim": len(vec),
+        "preview": vec[:20],  # first 20 numbers
+        "embedding": vec
+    }
+
+@app.get("/embed_text")
+def embed_text_get(text: str = Query(..., description="Text to embed")):
+    """
+    Return the raw embedding for a given text (GET).
+    Usage: /embed_text?text=hello
+    """
+    t = (text or "").strip()
+    if not t:
+        return {"error": "missing 'text' query param"}
+    vec = embed_jina([t])[0]
+    return {
+        "ok": True,
+        "dim": len(vec),
+        "preview": vec[:20],
+        "embedding": vec
+    }
+
+# Optional: list all routes for a quick sanity check
+@app.get("/__routes")
+def __routes():
+    return [r.path for r in app.routes]
+
 @app.post("/recreate/{collection}")
 def recreate(collection: str, dim: int, distance: str = "COSINE"):
     client.recreate_collection(
@@ -141,6 +177,10 @@ def upsert(collection: str, items: List[UpsertItem]):
     points = [qm.PointStruct(id=i.id, vector=i.vector, payload=i.payload) for i in items]
     client.upsert(collection_name=collection, points=points)
     return {"ok": True}
+
+class SearchReq(BaseModel):
+    vector: List[float]
+    limit: int = 3
 
 @app.post("/search/{collection}")
 def search(collection: str, req: SearchReq):
