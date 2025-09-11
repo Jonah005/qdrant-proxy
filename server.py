@@ -100,12 +100,7 @@ def upsert_intents(collection: str, dim: int, intents: List[Dict]):
     items, texts = [], []
     for intent in intents:
         for phrase in intent["phrases"]:
-            items.append({
-                "name": intent["name"],
-                "route": intent["route"],
-                "role": intent.get("role", "any"),
-                "text": phrase
-            })
+            items.append({"name": intent["name"], "route": intent["route"], "role": intent["role"], "text": phrase})
             texts.append(phrase)
     # embed + upsert
     vecs = embed_jina(texts)
