@@ -9,17 +9,22 @@ from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 
-# -------- env --------
+# -------------------- ENV --------------------
 QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
 JINA_API_KEY = os.getenv("JINA_API_KEY", "").strip()
 AUTO_SEED = os.getenv("AUTO_SEED", "1").strip()  # "1" = seed on startup
 
-# -------- clients/app --------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+ARBITER_MODEL = os.getenv(
+    "ARBITER_MODEL",
+    "mistralai/mistral-small-3.2-24b-instruct:free",
+).strip()
+
+# -------------------- CLIENTS / APP --------------------
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 app = FastAPI()
 
-# allow browser calls from your site
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -30,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------- models --------
+# -------------------- MODELS --------------------
 class UpsertItem(BaseModel):
     id: int
     vector: List[float]
@@ -44,10 +49,9 @@ class Intent(BaseModel):
     name: str
     role: str = "any"
     phrases: List[str]
-    # New/changed fields:
-    route: Optional[str] = None              # for navigation
-    response: Optional[str] = None           # for FAQs / answers
-    kind: str = Field(default="nav")         # "nav" or "faq" (you can add more later)
+    route: Optional[str] = None               # for navigation
+    response: Optional[str] = None            # for FAQs / answers
+    kind: str = Field(default="nav")          # "nav" or "faq"
 
 class SeedReq(BaseModel):
     collection: str
@@ -58,22 +62,26 @@ class SmartSearchReq(BaseModel):
     collection: str
     text: str
     limit: int = 3
-    # Optional filters to keep nav and faq separate at query time
-    kind: Optional[str] = None               # e.g., "nav" or "faq"
-    role: Optional[str] = None               # prefer results matching a role
+    kind: Optional[str] = None                # "nav" | "faq" (optional filter)
+    role: Optional[str] = None                # prefer results matching role
 
-# -------- helpers --------
+class AssistReq(BaseModel):
+    collection: str
+    text: str
+    role: Optional[str] = None
+    limit: int = 5
+    threshold: float = 0.80                   # ambiguity threshold
+    # If you want to force an arbiter pass (even for clear queries)
+    force_arbiter: bool = False
+
+# -------------------- HELPERS --------------------
 def embed_jina(texts: List[str]) -> List[List[float]]:
-    """Embed with Jina; minimal payload to avoid 422 'Extra inputs are not permitted'."""
+    """Embed with Jina; minimal payload to avoid 422s."""
     if not JINA_API_KEY:
         raise RuntimeError("JINA_API_KEY not set on server")
 
-    headers = {
-        "Authorization": f"Bearer {JINA_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {JINA_API_KEY}", "Content-Type": "application/json"}
 
-    # Try OpenAI-style: {"model": "...", "input": ["a", "b", ...]}
     r = requests.post(
         "https://api.jina.ai/v1/embeddings",
         headers=headers,
@@ -84,7 +92,6 @@ def embed_jina(texts: List[str]) -> List[List[float]]:
         data = r.json()
         return [d["embedding"] for d in data["data"]]
 
-    # Fallback to object-style on schema error
     if r.status_code == 422:
         r2 = requests.post(
             "https://api.jina.ai/v1/embeddings",
@@ -96,27 +103,22 @@ def embed_jina(texts: List[str]) -> List[List[float]]:
         data = r2.json()
         return [d["embedding"] for d in data["data"]]
 
-    # Log other errors verbosely for Render logs
     print("Jina error:", r.status_code, r.text)
     r.raise_for_status()
 
 def upsert_intents(collection: str, dim: int, intents: List[Dict]) -> int:
-    """
-    (Re)create collection, embed phrases, upsert points (1 point per phrase).
-    Payload includes: name, role, kind, route (optional), response (optional), text.
-    """
+    """(Re)create collection, embed phrases, upsert points."""
     client.recreate_collection(
         collection_name=collection,
         vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
     )
-
     items, texts = [], []
     for intent in intents:
         name = intent.get("name")
         role = intent.get("role", "any")
         kind = intent.get("kind", "nav")
-        route = intent.get("route")            # may be None for FAQ
-        response = intent.get("response")      # may be None for nav
+        route = intent.get("route")
+        response = intent.get("response")
 
         for phrase in intent["phrases"]:
             items.append({
@@ -138,7 +140,6 @@ def upsert_intents(collection: str, dim: int, intents: List[Dict]) -> int:
     return len(points)
 
 def _prefer_role(hits: List[Dict], role: Optional[str]) -> List[Dict]:
-    """Sort hits to prefer matching role (if provided), keeping higher score first."""
     if not role:
         return sorted(hits, key=lambda h: h["score"], reverse=True)
     return sorted(
@@ -147,24 +148,122 @@ def _prefer_role(hits: List[Dict], role: Optional[str]) -> List[Dict]:
         reverse=True,
     )
 
-# -------- endpoints --------
+def _hits_to_public(hits) -> List[Dict]:
+    return [{"score": float(h.score), "payload": h.payload} for h in hits]
+
+def _ambiguous(hits: List[Dict], threshold: float) -> bool:
+    """Heuristic to decide if we should ask the LLM to arbitrate."""
+    if not hits:
+        return True
+    top = hits[0]["score"]
+    if top < threshold:
+        return True
+    if len(hits) >= 2 and (top - hits[1]["score"]) < 0.08:
+        return True
+    # mixed kinds in the top-3?
+    kinds = { (h["payload"].get("kind") or "nav") for h in hits[:3] }
+    if len(kinds) > 1:
+        return True
+    return False
+
+def call_arbiter(user_query: str, hits: List[Dict]) -> Optional[Dict]:
+    """
+    Calls the LLM arbiter via OpenRouter to:
+      - clarify (ask a question),
+      - navigate (pick a route),
+      - answer (use FAQ response).
+
+    Returns a dict matching the schema below, or None on failure.
+
+    Schema to follow:
+      {
+        "mode": "clarify" | "navigate" | "answer",
+        "message": "short message for the user",
+        "route": "/path-or-null",
+        "picked_index": 0  # the index of chosen candidate (optional)
+      }
+    """
+    if not OPENROUTER_API_KEY:
+        return None
+
+    # Only pass minimal needed data to the LLM
+    compact = []
+    for i, h in enumerate(hits[:5]):
+        p = h["payload"]
+        compact.append({
+            "idx": i,
+            "score": round(h["score"], 4),
+            "name": p.get("name"),
+            "kind": p.get("kind"),
+            "role": p.get("role"),
+            "route": p.get("route"),
+            "response": p.get("response"),
+            "text_example": p.get("text"),
+        })
+
+    system = (
+        "You are a fast, precise support arbiter. "
+        "You must ONLY use the provided candidates—do not invent routes or answers. "
+        "If the user intent is unclear, return a single short clarification question. "
+        "If it is a navigation request, pick exactly one route from the candidates. "
+        "If it is an FAQ request, return a concise answer using the candidate's 'response'. "
+        "Output strict JSON matching this schema:\n"
+        "{"
+        "\"mode\":\"clarify|navigate|answer\","
+        "\"message\":\"string\","
+        "\"route\":\"string|null\","
+        "\"picked_index\":0"
+        "}"
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"User query: {user_query}"},
+        {"role": "user", "content": f"Candidates:\n{json.dumps(compact, ensure_ascii=False)}"},
+    ]
+
+    try:
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                # Optional attribution headers:
+                "HTTP-Referer": "https://qdrant-proxy.onrender.com",
+                "X-Title": "SMB Shopper Arbiter",
+            },
+            json={
+                "model": ARBITER_MODEL,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+                "max_tokens": 200,
+                "temperature": 0.2,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"]
+        data = json.loads(content)
+        # light validation
+        if data.get("mode") in {"clarify", "navigate", "answer"}:
+            return data
+        return None
+    except Exception as e:
+        print("Arbiter error:", repr(e))
+        return None
+
+# -------------------- ENDPOINTS --------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
 @app.get("/debug_embed")
 def debug_embed():
-    # quick sanity check: returns embedding length (should be 1024)
     vec = embed_jina(["hello world"])[0]
     return {"ok": True, "dim": len(vec)}
 
-# ---------- DEBUG: raw embedding endpoints ----------
 @app.post("/embed_text")
 def embed_text(body: Dict[str, str]):
-    """
-    Return the raw embedding for a given text (POST).
-    Body: { "text": "..." }
-    """
     text = (body or {}).get("text", "").strip()
     if not text:
         return {"error": "missing 'text'"}
@@ -173,17 +272,12 @@ def embed_text(body: Dict[str, str]):
 
 @app.get("/embed_text")
 def embed_text_get(text: str = Query(..., description="Text to embed")):
-    """
-    Return the raw embedding for a given text (GET).
-    Usage: /embed_text?text=hello
-    """
     t = (text or "").strip()
     if not t:
         return {"error": "missing 'text' query param"}
     vec = embed_jina([t])[0]
     return {"ok": True, "dim": len(vec), "preview": vec[:20], "embedding": vec}
 
-# Optional: list all routes for a quick sanity check
 @app.get("/__routes")
 def __routes():
     return [r.path for r in app.routes]
@@ -204,13 +298,13 @@ def upsert(collection: str, items: List[UpsertItem]):
 
 @app.post("/search/{collection}")
 def search(collection: str, req: SearchReq):
-    hits = client.search(
+    raw_hits = client.search(
         collection_name=collection,
         query_vector=req.vector,
         limit=req.limit,
         with_payload=True,
     )
-    return [{"score": float(h.score), "payload": h.payload} for h in hits]
+    return _hits_to_public(raw_hits)
 
 @app.post("/seed")
 def seed(req: SeedReq):
@@ -219,34 +313,105 @@ def seed(req: SeedReq):
 
 @app.post("/smart_search")
 def smart_search(req: SmartSearchReq):
+    vec = embed_jina([req.text])[0]
+    raw_hits = client.search(
+        collection_name=req.collection,
+        query_vector=vec,
+        limit=max(req.limit, 10),
+        with_payload=True,
+    )
+    hits = _hits_to_public(raw_hits)
+
+    if req.kind:
+        k = req.kind.lower()
+        hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == k]
+
+    hits = _prefer_role(hits, req.role)
+    return hits[: req.limit]
+
+# -------------------- High-level ASSIST endpoint --------------------
+@app.post("/assist")
+def assist(req: AssistReq):
     """
-    Vector search with optional filtering:
-      - kind: "nav" or "faq" (keeps behaviors separate)
-      - role: prefer results matching a role
-    Returns the usual hits [{ score, payload }, ...].
+    Orchestrated helper:
+      1) Embed + search
+      2) Ambiguity check
+      3) If ambiguous (or force_arbiter), call LLM arbiter
+      4) Return a normalized object {mode,message,route,picked,candidates}
     """
     vec = embed_jina([req.text])[0]
     raw_hits = client.search(
         collection_name=req.collection,
         query_vector=vec,
-        limit=max(req.limit, 10),  # fetch extra so filtering still has enough
+        limit=max(req.limit, 10),
         with_payload=True,
     )
-
-    hits = [{"score": float(h.score), "payload": h.payload} for h in raw_hits]
-
-    # filter by kind if requested
-    if req.kind:
-        k = req.kind.lower()
-        hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == k]
-
-    # prefer role if provided
+    hits = _hits_to_public(raw_hits)
     hits = _prefer_role(hits, req.role)
+    hits = hits[: req.limit]
 
-    # truncate to requested limit
-    return hits[: req.limit]
+    # Nothing found → ask a generic clarification (no LLM needed)
+    if not hits:
+        return {
+            "mode": "clarify",
+            "message": "I couldn’t match that. Do you want to open a page (e.g., Pending/Accepted orders) or ask a question about orders?",
+            "route": None,
+            "picked": None,
+            "candidates": hits,
+        }
 
-# -------- auto-seed on startup (nav intents only) --------
+    # If forced or ambiguous, try arbiter
+    if req.force_arbiter or _ambiguous(hits, req.threshold):
+        arb = call_arbiter(req.text, hits)
+        if arb:
+            picked = None
+            if isinstance(arb.get("picked_index"), int):
+                idx = arb["picked_index"]
+                if 0 <= idx < len(hits):
+                    picked = hits[idx]["payload"]
+            # If mode=navigate but LLM forgot route, try to lift from picked
+            route = arb.get("route")
+            if arb.get("mode") == "navigate" and not route and picked:
+                route = picked.get("route")
+            return {
+                "mode": arb.get("mode", "clarify"),
+                "message": arb.get("message", "").strip() or "Can you clarify?",
+                "route": route,
+                "picked": picked,
+                "candidates": hits,
+            }
+        # Arbiter failed → fall back
+
+    # Clear enough → pick top hit deterministically
+    top = hits[0]["payload"]
+    if (top.get("kind") or "nav") == "nav" and top.get("route"):
+        return {
+            "mode": "navigate",
+            "message": f"Taking you to {top.get('name')}.",
+            "route": top.get("route"),
+            "picked": top,
+            "candidates": hits,
+        }
+    # FAQ answer path
+    if (top.get("kind") or "faq") == "faq" and top.get("response"):
+        return {
+            "mode": "answer",
+            "message": top.get("response"),
+            "route": None,
+            "picked": top,
+            "candidates": hits,
+        }
+
+    # Fallback if payload incomplete
+    return {
+        "mode": "fallback",
+        "message": "I found a likely match but cannot complete the action automatically.",
+        "route": top.get("route"),
+        "picked": top,
+        "candidates": hits,
+    }
+
+# -------------------- AUTO-SEED (nav intents) --------------------
 @app.on_event("startup")
 def startup_seed():
     if AUTO_SEED != "1":
@@ -262,6 +427,7 @@ def startup_seed():
                 "what orders are still waiting",
                 "orders not accepted yet",
                 "pending customer orders",
+                "where to see incomplete orders",
             ],
         },
         {
