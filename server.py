@@ -74,7 +74,7 @@ class AssistReq(BaseModel):
     context: Optional[str] = None                  # short line like "We discussed pending vs accepted"
     history: Optional[List[Dict[str, str]]] = None # [{role:'user'|'assistant', content:'...'}]
     prior_candidates: Optional[List[Dict]] = None  # last /assist "candidates"
-    kind: Optional[str] = None                     # <-- added so /assist can filter by kind
+    kind: Optional[str] = None
 
 # -------------------- HELPERS --------------------
 def embed_jina(texts: List[str]) -> List[List[float]]:
@@ -181,6 +181,27 @@ def _clip_history(history: Optional[List[Dict[str, str]]], max_turns: int = 4) -
         return []
     clean = [m for m in history if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)]
     return clean[-max_turns:]
+
+# ---------- intent hints: question vs action ----------
+QUESTION_WORDS = re.compile(r"\b(what|why|how|when|which|who|where|meaning|explain|difference|help)\b", re.I)
+ACTION_WORDS   = re.compile(r"\b(show|open|go to|navigate|take me|list|display|see|view|find)\b", re.I)
+
+def _looks_like_question(text: Optional[str]) -> bool:
+    t = (text or "").strip().lower()
+    return ("?" in t) or bool(QUESTION_WORDS.search(t))
+
+def _looks_like_action(text: Optional[str]) -> bool:
+    t = (text or "").strip().lower()
+    return bool(ACTION_WORDS.search(t))
+
+def _intent_hint_from_text(text: Optional[str]) -> str:
+    q = _looks_like_question(text)
+    a = _looks_like_action(text)
+    if q and not a:
+        return "question"
+    if a and not q:
+        return "action"
+    return "unknown"
 
 # ---------- alias builder for arbiter (token-agnostic) ----------
 def _aliases_from_payload(p: Dict) -> str:
@@ -381,6 +402,7 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
         "2) If the user references an index (1/2/3 or first/second/third), pick that index.\n"
         "3) Otherwise compare the latest user message with each candidate's NAME/TEXT/ALIASES (case-insensitive), and choose the best match.\n"
         "4) Only return \"clarify\" if there is truly no way to decide.\n"
+        "5) If the user's message looks like a question (contains '?' or starts with what/why/how/etc.), PREFER 'answer' over 'navigate' when any FAQ candidate is plausible.\n"
         "Return strict JSON ONLY: "
         "{\"mode\":\"clarify|navigate|answer\",\"message\":\"string\",\"route\":null|\"/path\",\"picked_index\":0}\n"
     )
@@ -571,6 +593,34 @@ def assist(req: AssistReq):
             "options": [],
         }
 
+    # ---------- NEW: steer questions away from navigation ----------
+    intent_hint = _intent_hint_from_text(req.text)
+    if intent_hint == "question":
+        # If we have FAQ candidates, answer the top FAQ
+        faq_hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == "faq"]
+        if faq_hits:
+            p = faq_hits[0]["payload"]
+            if p.get("response"):
+                return {
+                    "mode": "answer",
+                    "message": p["response"],
+                    "route": None,
+                    "picked": p,
+                    "candidates": hits,
+                }
+        # Otherwise, ask a targeted clarify (do NOT navigate)
+        clar = _clarify_from_hits(hits)
+        return {
+            "mode": "clarify",
+            "message": "Are you asking what these options mean, or do you want me to open one: " +
+                       ", ".join([o["name"] for o in clar["options"] if o.get("name")]) + "?",
+            "route": None,
+            "picked": None,
+            "candidates": hits,
+            "options": clar["options"],
+        }
+    # ---------- END NEW ----------
+
     # 2.5) Single-survivor auto-resolve
     filtered = hits
     if req.kind:
@@ -628,29 +678,36 @@ def assist(req: AssistReq):
                 resp.setdefault("options", clar["options"])
             return resp
 
-    # If previous turn was clarify and we're still here, break the loop deterministically
+    # If previous turn was clarify and it's still unclear: respect question intent again
     if prev_was_clarify:
-        top = hits[0]["payload"]
-        if (top.get("kind") or "nav") == "nav" and top.get("route"):
+        qhint = (_intent_hint_from_text(req.text) == "question")
+        if qhint:
+            faq_hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == "faq"]
+            if faq_hits and faq_hits[0]["payload"].get("response"):
+                p = faq_hits[0]["payload"]
+                return {
+                    "mode": "answer",
+                    "message": p["response"],
+                    "route": None,
+                    "picked": p,
+                    "candidates": hits,
+                }
+            clar = _clarify_from_hits(hits)
             return {
-                "mode": "navigate",
-                "message": f"Taking you to {top.get('name')}.",
-                "route": top.get("route"),
-                "picked": top,
-                "candidates": hits,
-            }
-        if (top.get("kind") or "faq") == "faq" and top.get("response"):
-            return {
-                "mode": "answer",
-                "message": top.get("response"),
+                "mode": "clarify",
+                "message": clar["message"],
                 "route": None,
-                "picked": top,
+                "picked": None,
                 "candidates": hits,
+                "options": clar["options"],
             }
+        # else: proceed to deterministic pick below
 
     # 4) Clear enough → deterministic pick
     top = hits[0]["payload"]
-    if (top.get("kind") or "nav") == "nav" and top.get("route"):
+    questiony = (_intent_hint_from_text(req.text) == "question")
+
+    if (top.get("kind") or "nav") == "nav" and top.get("route") and not questiony:
         return {
             "mode": "navigate",
             "message": f"Taking you to {top.get('name')}.",
