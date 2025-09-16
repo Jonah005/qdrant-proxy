@@ -1,4 +1,4 @@
-import os, json, requests
+import os, json, requests, re
 from typing import List, Dict, Optional
 
 from fastapi import FastAPI, Query
@@ -70,10 +70,10 @@ class AssistReq(BaseModel):
     limit: int = 5
     threshold: float = 0.80
     force_arbiter: bool = False
-    # Lightweight context to maintain coherence across turns
-    context: Optional[str] = None                    # a single short line like "We were discussing pending vs accepted"
-    history: Optional[List[Dict[str, str]]] = None   # [{ "role": "user|assistant", "content": "..." }]
-    prior_candidates: Optional[List[Dict]] = None    # previously returned "candidates" from /assist
+    # Lightweight context across turns
+    context: Optional[str] = None                  # short line like "We discussed pending vs accepted"
+    history: Optional[List[Dict[str, str]]] = None # [{role:'user'|'assistant', content:'...'}]
+    prior_candidates: Optional[List[Dict]] = None  # last /assist "candidates"
 
 # -------------------- HELPERS --------------------
 def embed_jina(texts: List[str]) -> List[List[float]]:
@@ -126,6 +126,35 @@ def upsert_intents(collection: str, dim: int, intents: List[Dict]) -> int:
     client.upsert(collection, points=points)
     return len(points)
 
+def upsert_intents_append(collection: str, intents: List[Dict]) -> int:
+    """
+    Append-only upsert (does NOT recreate the collection).
+    Assumes dim=1024 & COSINE from earlier create; will just add new points.
+    """
+    items, texts = [], []
+    for intent in intents:
+        for phrase in intent["phrases"]:
+            items.append({
+                "name": intent.get("name"),
+                "role": intent.get("role", "any"),
+                "kind": intent.get("kind", "nav"),
+                "route": intent.get("route"),
+                "response": intent.get("response"),
+                "text": phrase,
+            })
+            texts.append(phrase)
+
+    # Find a starting ID > current max (cheap: ask for count and offset)
+    # Simpler: pick a large base; duplicates are rare with this scheme.
+    BASE = 1_000_000
+    vecs = embed_jina(texts)
+    points = []
+    for i in range(len(items)):
+        points.append(qm.PointStruct(id=BASE + i, vector=vecs[i], payload=items[i]))
+
+    client.upsert(collection, points=points)
+    return len(points)
+
 def _prefer_role(hits: List[Dict], role: Optional[str]) -> List[Dict]:
     if not role:
         return sorted(hits, key=lambda h: h["score"], reverse=True)
@@ -152,14 +181,12 @@ def _ambiguous(hits: List[Dict], threshold: float) -> bool:
     return False
 
 def _clip_history(history: Optional[List[Dict[str, str]]], max_turns: int = 4) -> List[Dict[str, str]]:
-    """Keep only the last N turns (user/assistant messages)."""
     if not history:
         return []
     clean = [m for m in history if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)]
     return clean[-max_turns:]
 
 def _compact_candidates(hits: List[Dict]) -> List[Dict]:
-    """Minify candidate payloads sent to the LLM."""
     compact = []
     for i, h in enumerate(hits[:5]):
         p = h["payload"]
@@ -176,7 +203,6 @@ def _compact_candidates(hits: List[Dict]) -> List[Dict]:
     return compact
 
 def _topic_hint_from_hits(hits: List[Dict]) -> str:
-    """A tiny hint to help the arbiter resolve pronouns like 'those two'."""
     names = []
     kinds = set()
     for h in hits[:3]:
@@ -193,28 +219,67 @@ def _topic_hint_from_hits(hits: List[Dict]) -> str:
     return hint.strip()
 
 def _safe_json_loads(s: str) -> Optional[Dict]:
-    """Tolerate accidental code fences around JSON."""
     try:
         return json.loads(s)
     except Exception:
         pass
-    # strip common fences if present
     s2 = s.strip()
     if s2.startswith("```"):
-        s2 = s2.strip("`")
-        # after stripping backticks, try again
+        # strip common fenced blocks
+        s2 = re.sub(r"^```[a-zA-Z]*\n?", "", s2).rstrip("`").strip()
         try:
             return json.loads(s2)
         except Exception:
             pass
     return None
 
-def call_arbiter(
-    user_query: str,
-    hits: List[Dict],
-    context: Optional[str] = None,
-    history: Optional[List[Dict[str, str]]] = None
-) -> Optional[Dict]:
+_CONFIRM_RE = re.compile(r"\b(ok(ay)?|yes|ya|sure|please|go|take me|proceed|do it)\b", re.I)
+
+def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
+    """
+    Heuristics to resolve short follow-ups using previous candidates (no LLM):
+    - If text is a confirmation, take top NAV candidate.
+    - If text mentions a candidate name token ('pending', 'accepted'), pick that candidate.
+    """
+    if not prior:
+        return None
+
+    # Normalize incoming prior to payload list
+    def to_payload(h):
+        return h["payload"] if "payload" in h else h
+
+    payloads = [to_payload(h) for h in prior]
+
+    # 1) Pure confirmation → prefer highest-scoring NAV with route
+    if _CONFIRM_RE.search(text or ""):
+        for h in prior:
+            p = to_payload(h)
+            if (p.get("kind") or "nav") == "nav" and p.get("route"):
+                return p
+        # else fallback to first payload
+        return payloads[0]
+
+    # 2) Name token match
+    t = (text or "").lower()
+    # simple tokens; extend as you add more intents
+    TOKENS = {
+        "pending": "pending",
+        "accepted": "accepted",
+        "new": "new",
+        "shop": "shop",
+        "create": "create",
+        "order": "order"
+    }
+    for token in TOKENS:
+        if token in t:
+            for p in payloads:
+                name = (p.get("name") or "").lower()
+                if token in name:
+                    return p
+
+    return None
+
+def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> Optional[Dict]:
     if not OPENROUTER_API_KEY:
         return None
 
@@ -329,6 +394,15 @@ def seed(req: SeedReq):
     count = upsert_intents(req.collection, req.dim, [i.dict() for i in req.intents])
     return {"ok": True, "count": count}
 
+@app.post("/seed_append")
+def seed_append(req: SeedReq):
+    """
+    Append-only seeding (does not recreate the collection).
+    Handy for adding FAQs incrementally via Postman.
+    """
+    count = upsert_intents_append(req.collection, [i.dict() for i in req.intents])
+    return {"ok": True, "count": count}
+
 @app.post("/smart_search")
 def smart_search(req: SmartSearchReq):
     vec = embed_jina([req.text])[0]
@@ -347,14 +421,34 @@ def smart_search(req: SmartSearchReq):
 # -------------------- High-level ASSIST (context-aware) --------------------
 @app.post("/assist")
 def assist(req: AssistReq):
-    # If the client passed a previous shortlist, sanitize and reuse for continuity
+    # 0) Try to resolve from prior candidates for short confirmations or name mentions
+    picked_from_prior = None
     if req.prior_candidates:
+        picked_from_prior = _select_from_prior(req.prior_candidates, req.text)
+        if picked_from_prior:
+            if (picked_from_prior.get("kind") or "nav") == "nav" and picked_from_prior.get("route"):
+                return {
+                    "mode": "navigate",
+                    "message": f"Taking you to {picked_from_prior.get('name')}.",
+                    "route": picked_from_prior.get("route"),
+                    "picked": picked_from_prior,
+                    "candidates": req.prior_candidates,
+                }
+            if (picked_from_prior.get("kind") or "faq") == "faq" and picked_from_prior.get("response"):
+                return {
+                    "mode": "answer",
+                    "message": picked_from_prior.get("response"),
+                    "route": None,
+                    "picked": picked_from_prior,
+                    "candidates": req.prior_candidates,
+                }
+
+    # 1) fresh vector search (if not using prior candidate list)
+    if req.prior_candidates and not picked_from_prior:
         hits = []
         for h in req.prior_candidates[: req.limit]:
-            # Accept both raw dicts or already-public hits
             if "payload" in h and "score" in h:
                 hits.append({"score": float(h["score"]), "payload": dict(h["payload"])})
-        # Fall back to fresh search if the provided list is empty
         if not hits:
             req.prior_candidates = None
 
@@ -370,6 +464,7 @@ def assist(req: AssistReq):
         hits = _prefer_role(hits, req.role)
         hits = hits[: req.limit]
 
+    # 2) nothing found → generic clarify
     if not hits:
         return {
             "mode": "clarify",
@@ -379,7 +474,14 @@ def assist(req: AssistReq):
             "candidates": hits,
         }
 
-    if req.force_arbiter or _ambiguous(hits, req.threshold):
+    # 3) adjust ambiguity threshold if there is history (be less naggy)
+    eff_threshold = req.threshold
+    if req.history:
+        eff_threshold = max(0.70, req.threshold - 0.06)
+
+    need_arbiter = req.force_arbiter or _ambiguous(hits, eff_threshold)
+
+    if need_arbiter:
         arb = call_arbiter(req.text, hits, context=req.context, history=req.history)
         if arb:
             picked = None
@@ -396,6 +498,7 @@ def assist(req: AssistReq):
                 "candidates": hits,
             }
 
+    # 4) clear enough → deterministic pick
     top = hits[0]["payload"]
     if (top.get("kind") or "nav") == "nav" and top.get("route"):
         return {
