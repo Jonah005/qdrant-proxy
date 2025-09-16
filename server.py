@@ -70,10 +70,10 @@ class AssistReq(BaseModel):
     limit: int = 5
     threshold: float = 0.80
     force_arbiter: bool = False
-    # NEW: lightweight conversation context
-    context: Optional[str] = None                    # e.g., last assistant question or short summary
+    # Lightweight context to maintain coherence across turns
+    context: Optional[str] = None                    # a single short line like "We were discussing pending vs accepted"
     history: Optional[List[Dict[str, str]]] = None   # [{ "role": "user|assistant", "content": "..." }]
-    prior_candidates: Optional[List[Dict]] = None    # pass previous /assist "candidates" array
+    prior_candidates: Optional[List[Dict]] = None    # previously returned "candidates" from /assist
 
 # -------------------- HELPERS --------------------
 def embed_jina(texts: List[str]) -> List[List[float]]:
@@ -151,15 +151,15 @@ def _ambiguous(hits: List[Dict], threshold: float) -> bool:
         return True
     return False
 
-def call_arbiter(
-    user_query: str,
-    hits: List[Dict],
-    context: Optional[str] = None,
-    history: Optional[List[Dict[str, str]]] = None
-) -> Optional[Dict]:
-    if not OPENROUTER_API_KEY:
-        return None
+def _clip_history(history: Optional[List[Dict[str, str]]], max_turns: int = 4) -> List[Dict[str, str]]:
+    """Keep only the last N turns (user/assistant messages)."""
+    if not history:
+        return []
+    clean = [m for m in history if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)]
+    return clean[-max_turns:]
 
+def _compact_candidates(hits: List[Dict]) -> List[Dict]:
+    """Minify candidate payloads sent to the LLM."""
     compact = []
     for i, h in enumerate(hits[:5]):
         p = h["payload"]
@@ -173,25 +173,71 @@ def call_arbiter(
             "response": p.get("response"),
             "text_example": p.get("text"),
         })
+    return compact
+
+def _topic_hint_from_hits(hits: List[Dict]) -> str:
+    """A tiny hint to help the arbiter resolve pronouns like 'those two'."""
+    names = []
+    kinds = set()
+    for h in hits[:3]:
+        p = h["payload"]
+        if p.get("name"):
+            names.append(p["name"])
+        if p.get("kind"):
+            kinds.add(p["kind"])
+    hint = ""
+    if names:
+        hint += "Candidates include: " + ", ".join(names) + ". "
+    if kinds:
+        hint += "Kinds present: " + ", ".join(sorted(kinds)) + "."
+    return hint.strip()
+
+def _safe_json_loads(s: str) -> Optional[Dict]:
+    """Tolerate accidental code fences around JSON."""
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # strip common fences if present
+    s2 = s.strip()
+    if s2.startswith("```"):
+        s2 = s2.strip("`")
+        # after stripping backticks, try again
+        try:
+            return json.loads(s2)
+        except Exception:
+            pass
+    return None
+
+def call_arbiter(
+    user_query: str,
+    hits: List[Dict],
+    context: Optional[str] = None,
+    history: Optional[List[Dict[str, str]]] = None
+) -> Optional[Dict]:
+    if not OPENROUTER_API_KEY:
+        return None
+
+    compact = _compact_candidates(hits)
+    topic_hint = _topic_hint_from_hits(hits)
 
     system = (
         "You are a precise, fast support arbiter. "
         "Use ONLY the provided candidates—do not invent routes or answers. "
-        "If the user intent is unclear, return ONE short clarification question. "
-        "If it's navigation, pick exactly one candidate route. "
-        "If it's FAQ, return the candidate's 'response'. "
+        "If intent is unclear, return ONE short clarification question. "
+        "If navigation, pick exactly one candidate route. "
+        "If FAQ, return the candidate's 'response'. "
         "Return strict JSON: "
         "{\"mode\":\"clarify|navigate|answer\",\"message\":\"string\",\"route\":\"string|null\",\"picked_index\":0}"
     )
 
     messages = [{"role": "system", "content": system}]
-    # Optional lightweight context/history to keep coherence
-    if history:
-        for m in history:
-            if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str):
-                messages.append({"role": m["role"], "content": m["content"]})
+    for m in _clip_history(history, max_turns=4):
+        messages.append({"role": m["role"], "content": m["content"]})
     if context:
         messages.append({"role": "user", "content": f"Context: {context}"})
+    if topic_hint:
+        messages.append({"role": "user", "content": f"Topic hint: {topic_hint}"})
 
     messages.append({"role": "user", "content": f"User query: {user_query}"})
     messages.append({"role": "user", "content": f"Candidates:\n{json.dumps(compact, ensure_ascii=False)}"})
@@ -216,7 +262,7 @@ def call_arbiter(
         )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
-        data = json.loads(content)
+        data = _safe_json_loads(content) or {}
         if data.get("mode") in {"clarify", "navigate", "answer"}:
             return data
         return None
@@ -301,10 +347,18 @@ def smart_search(req: SmartSearchReq):
 # -------------------- High-level ASSIST (context-aware) --------------------
 @app.post("/assist")
 def assist(req: AssistReq):
-    # If the client passed a previous shortlist, reuse it for continuity
+    # If the client passed a previous shortlist, sanitize and reuse for continuity
     if req.prior_candidates:
-        hits = req.prior_candidates[: req.limit]
-    else:
+        hits = []
+        for h in req.prior_candidates[: req.limit]:
+            # Accept both raw dicts or already-public hits
+            if "payload" in h and "score" in h:
+                hits.append({"score": float(h["score"]), "payload": dict(h["payload"])})
+        # Fall back to fresh search if the provided list is empty
+        if not hits:
+            req.prior_candidates = None
+
+    if not req.prior_candidates:
         vec = embed_jina([req.text])[0]
         raw_hits = client.search(
             collection_name=req.collection,
