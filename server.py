@@ -524,6 +524,7 @@ def smart_search(req: SmartSearchReq):
 # -------------------- High-level ASSIST (context-aware) --------------------
 @app.post("/assist")
 def assist(req: AssistReq):
+    hits: List[Dict] = []  # <-- make sure it's always defined
     # 0) Try to resolve from prior candidates quickly
     picked_from_prior = None
     if req.prior_candidates:
