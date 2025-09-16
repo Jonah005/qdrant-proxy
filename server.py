@@ -74,6 +74,7 @@ class AssistReq(BaseModel):
     context: Optional[str] = None                  # short line like "We discussed pending vs accepted"
     history: Optional[List[Dict[str, str]]] = None # [{role:'user'|'assistant', content:'...'}]
     prior_candidates: Optional[List[Dict]] = None  # last /assist "candidates"
+    kind: Optional[str] = None                     # <-- added so /assist can filter by kind
 
 # -------------------- HELPERS --------------------
 def embed_jina(texts: List[str]) -> List[List[float]]:
@@ -123,7 +124,7 @@ def upsert_intents(collection: str, dim: int, intents: List[Dict]) -> int:
 
     vecs = embed_jina(texts)
     points = [qm.PointStruct(id=i+1, vector=vecs[i], payload=items[i]) for i in range(len(items))]
-    client.upsert(collection, points=points)
+    client.upsert(collection_name=collection, points=points)
     return len(points)
 
 def upsert_intents_append(collection: str, intents: List[Dict]) -> int:
@@ -147,7 +148,7 @@ def upsert_intents_append(collection: str, intents: List[Dict]) -> int:
     BASE = 1_000_000  # simple large base to avoid ID collisions
     vecs = embed_jina(texts)
     points = [qm.PointStruct(id=BASE + i, vector=vecs[i], payload=items[i]) for i in range(len(items))]
-    client.upsert(collection, points=points)
+    client.upsert(collection_name=collection, points=points)
     return len(points)
 
 def _prefer_role(hits: List[Dict], role: Optional[str]) -> List[Dict]:
@@ -181,9 +182,8 @@ def _clip_history(history: Optional[List[Dict[str, str]]], max_turns: int = 4) -
     clean = [m for m in history if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)]
     return clean[-max_turns:]
 
-# ---------- NEW: alias builder for arbiter (token-agnostic) ----------
+# ---------- alias builder for arbiter (token-agnostic) ----------
 def _aliases_from_payload(p: Dict) -> str:
-    # derive only from existing fields (no domain-specific tokens)
     fields = []
     for key in ("name", "route", "response", "text"):
         v = p.get(key)
@@ -204,7 +204,7 @@ def _compact_candidates(hits: List[Dict]) -> List[Dict]:
             "route": p.get("route"),
             "response": p.get("response"),
             "text_example": p.get("text"),
-            "aliases": _aliases_from_payload(p),   # NEW
+            "aliases": _aliases_from_payload(p),
         })
     return compact
 
@@ -263,14 +263,7 @@ def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
         return payloads[0]
 
     t = (text or "").lower()
-    TOKENS = {
-        "pending": "pending",
-        "accepted": "accepted",
-        "new": "new",
-        "shop": "shop",
-        "create": "create",
-        "order": "order"
-    }
+    TOKENS = {"pending": "pending", "accepted": "accepted", "new": "new", "shop": "shop", "create": "create", "order": "order"}
     for token in TOKENS:
         if token in t:
             for p in payloads:
@@ -279,7 +272,7 @@ def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
                     return p
     return None
 
-# ---------- NEW: better clarification generator ----------
+# ---------- better clarification generator ----------
 def _human_join(items: List[str]) -> str:
     items = [s for s in items if s]
     if not items:
@@ -291,7 +284,6 @@ def _human_join(items: List[str]) -> str:
     return f"{', '.join(items[:-1])}, or {items[-1]}"
 
 def _clarify_from_hits(hits: List[Dict]) -> Dict[str, object]:
-    """Build a short, natural clarification + structured options from top hits."""
     seen = set()
     tops = []
     for h in hits[:4]:
@@ -323,48 +315,39 @@ def _clarify_from_hits(hits: List[Dict]) -> Dict[str, object]:
 
     return {"message": message, "options": options}
 
-_GENERIC_PHRASES = re.compile(
-    r"(clarify|specify|which one|what do you mean|more details|elaborate)",
-    re.I
-)
+_GENERIC_PHRASES = re.compile(r"(clarify|specify|which one|what do you mean|more details|elaborate)", re.I)
 
 def _too_generic(msg: Optional[str], candidate_names: List[str]) -> bool:
-    """Detect vague arbiter questions without candidate signal."""
     if not msg:
         return True
     if len(msg.strip()) < 20:
         return True
     if _GENERIC_PHRASES.search(msg):
-        # if none of the candidate names appear, call it generic
         lower = msg.lower()
         if not any((n or "").lower() in lower for n in candidate_names if n):
             return True
     return False
 
-# ---------- NEW: previous-turn clarify detector ----------
+# ---------- previous-turn clarify detector ----------
 def _previous_turn_was_clarify(history: Optional[List[Dict[str, str]]]) -> bool:
     if not history:
         return False
-    # scan back until we hit the last assistant message or user message
     for m in reversed(history):
         role = m.get("role")
         content = (m.get("content") or "").lower()
         if role == "assistant":
-            # treat any assistant message containing "clarif" as a clarify turn
             return "clarif" in content
         if role == "user":
-            # user turn after assistant; if we didn't find an assistant clarify earlier, return False
             return False
     return False
 
-# ---------- NEW: consolidate query after clarify ----------
+# ---------- consolidate query after clarify ----------
 def _consolidated_query(req: AssistReq) -> Optional[str]:
     if not req.history:
         return None
     last_user = None
     prev_user = None
     last_assistant_clarify = None
-    # look at a small window
     for m in reversed(req.history[-6:]):
         r, c = m.get("role"), m.get("content", "")
         if r == "assistant" and last_assistant_clarify is None and "clarif" in c.lower():
@@ -388,7 +371,6 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
     compact = _compact_candidates(hits)
     topic_hint = _topic_hint_from_hits(hits)
 
-    # STRONGER, DECISIVE PROMPT
     system = (
         "You are a precise, fast support arbiter.\n"
         "You MUST choose exactly one of the PROVIDED candidates unless NONE are plausible.\n"
@@ -524,7 +506,8 @@ def smart_search(req: SmartSearchReq):
 # -------------------- High-level ASSIST (context-aware) --------------------
 @app.post("/assist")
 def assist(req: AssistReq):
-    hits: List[Dict] = []  # <-- make sure it's always defined
+    hits: List[Dict] = []  # ensure defined
+
     # 0) Try to resolve from prior candidates quickly
     picked_from_prior = None
     if req.prior_candidates:
@@ -551,7 +534,7 @@ def assist(req: AssistReq):
     if req.prior_candidates and not picked_from_prior:
         hits = []
         for h in req.prior_candidates[: req.limit]:
-            if "payload" in h and "score" in h:
+            if isinstance(h, dict) and "payload" in h and "score" in h:
                 hits.append({"score": float(h["score"]), "payload": dict(h["payload"])})
         if not hits:
             req.prior_candidates = None
@@ -559,7 +542,7 @@ def assist(req: AssistReq):
     prev_was_clarify = _previous_turn_was_clarify(req.history)
 
     if not req.prior_candidates:
-        # Consolidate query if previous turn was a clarify: include brief trail to lift right candidate
+        # Consolidate query if previous turn was a clarify
         use_text = req.text
         cq = _consolidated_query(req)
         if cq:
@@ -572,7 +555,6 @@ def assist(req: AssistReq):
             with_payload=True,
         )
         hits = _hits_to_public(raw_hits)
-        # Optional: pre-filter by kind if specified
         if req.kind:
             hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == req.kind.lower()]
         hits = _prefer_role(hits, req.role)
@@ -589,7 +571,7 @@ def assist(req: AssistReq):
             "options": [],
         }
 
-    # 2.5) Single-survivor auto-resolve (breaks loops without LLM)
+    # 2.5) Single-survivor auto-resolve
     filtered = hits
     if req.kind:
         filtered = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == req.kind.lower()]
@@ -602,20 +584,19 @@ def assist(req: AssistReq):
             return {"mode": "answer", "message": p.get("response"),
                     "route": None, "picked": p, "candidates": hits}
 
-    # 3) Ambiguity check (less strict if there is history; even less right after clarify)
+    # 3) Ambiguity check (less strict if history; even less right after clarify)
     eff_threshold = req.threshold
     if req.history:
         eff_threshold = max(0.70, req.threshold - 0.06)
         if prev_was_clarify:
-            eff_threshold = max(0.60, eff_threshold - 0.10)  # be bolder immediately after a clarify
+            eff_threshold = max(0.60, eff_threshold - 0.10)
 
     need_arbiter = req.force_arbiter or _ambiguous(hits, eff_threshold)
 
-    # 3.5) If we JUST clarified and it's still ambiguous, prefer deterministic pick to avoid loops
+    # 3.5) Arbiter (but avoid clarify loops)
     if need_arbiter and not prev_was_clarify:
         arb = call_arbiter(req.text, hits, context=req.context, history=req.history)
         if arb:
-            # If arbiter says "clarify" but it's too generic, replace with our specific clarification
             names = [h["payload"].get("name") for h in hits if h["payload"].get("name")]
             if arb.get("mode") == "clarify" and _too_generic(arb.get("message"), names):
                 clar = _clarify_from_hits(hits)
@@ -642,13 +623,12 @@ def assist(req: AssistReq):
                 "picked": picked,
                 "candidates": hits,
             }
-            # If clarify and message looks fine, also attach options for UI
             if resp["mode"] == "clarify":
                 clar = _clarify_from_hits(hits)
                 resp.setdefault("options", clar["options"])
             return resp
 
-    # If previous turn was clarify and we're still here (or arbiter kept clarifying), break the loop deterministically
+    # If previous turn was clarify and we're still here, break the loop deterministically
     if prev_was_clarify:
         top = hits[0]["payload"]
         if (top.get("kind") or "nav") == "nav" and top.get("route"):
