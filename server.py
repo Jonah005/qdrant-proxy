@@ -144,14 +144,9 @@ def upsert_intents_append(collection: str, intents: List[Dict]) -> int:
             })
             texts.append(phrase)
 
-    # Find a starting ID > current max (cheap: ask for count and offset)
-    # Simpler: pick a large base; duplicates are rare with this scheme.
-    BASE = 1_000_000
+    BASE = 1_000_000  # simple large base to avoid ID collisions
     vecs = embed_jina(texts)
-    points = []
-    for i in range(len(items)):
-        points.append(qm.PointStruct(id=BASE + i, vector=vecs[i], payload=items[i]))
-
+    points = [qm.PointStruct(id=BASE + i, vector=vecs[i], payload=items[i]) for i in range(len(items))]
     client.upsert(collection, points=points)
     return len(points)
 
@@ -225,7 +220,6 @@ def _safe_json_loads(s: str) -> Optional[Dict]:
         pass
     s2 = s.strip()
     if s2.startswith("```"):
-        # strip common fenced blocks
         s2 = re.sub(r"^```[a-zA-Z]*\n?", "", s2).rstrip("`").strip()
         try:
             return json.loads(s2)
@@ -244,24 +238,19 @@ def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
     if not prior:
         return None
 
-    # Normalize incoming prior to payload list
     def to_payload(h):
         return h["payload"] if "payload" in h else h
 
     payloads = [to_payload(h) for h in prior]
 
-    # 1) Pure confirmation → prefer highest-scoring NAV with route
     if _CONFIRM_RE.search(text or ""):
         for h in prior:
             p = to_payload(h)
             if (p.get("kind") or "nav") == "nav" and p.get("route"):
                 return p
-        # else fallback to first payload
         return payloads[0]
 
-    # 2) Name token match
     t = (text or "").lower()
-    # simple tokens; extend as you add more intents
     TOKENS = {
         "pending": "pending",
         "accepted": "accepted",
@@ -276,9 +265,71 @@ def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
                 name = (p.get("name") or "").lower()
                 if token in name:
                     return p
-
     return None
 
+# ---------- NEW: better clarification generator ----------
+def _human_join(items: List[str]) -> str:
+    items = [s for s in items if s]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} or {items[1]}"
+    return f"{', '.join(items[:-1])}, or {items[-1]}"
+
+def _clarify_from_hits(hits: List[Dict]) -> Dict[str, object]:
+    """Build a short, natural clarification + structured options from top hits."""
+    seen = set()
+    tops = []
+    for h in hits[:4]:
+        name = (h["payload"].get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tops.append(h)
+
+    options = [{
+        "name": t["payload"].get("name"),
+        "kind": t["payload"].get("kind"),
+        "route": t["payload"].get("route"),
+    } for t in tops]
+
+    names = [t["payload"].get("name") for t in tops if t["payload"].get("name")]
+
+    if not names:
+        message = "Do you want me to open a page or explain something about your orders?"
+    elif len(names) == 1:
+        message = f"Did you mean {names[0]}?"
+    elif len(names) == 2:
+        message = f"Do you want {_human_join(names)}?"
+    else:
+        message = f"Which one do you want: {_human_join(names)}?"
+
+    return {"message": message, "options": options}
+
+_GENERIC_PHRASES = re.compile(
+    r"(clarify|specify|which one|what do you mean|more details|elaborate)",
+    re.I
+)
+
+def _too_generic(msg: Optional[str], candidate_names: List[str]) -> bool:
+    """Detect vague arbiter questions without candidate signal."""
+    if not msg:
+        return True
+    if len(msg.strip()) < 20:
+        return True
+    if _GENERIC_PHRASES.search(msg):
+        # if none of the candidate names appear, call it generic
+        lower = msg.lower()
+        if not any((n or "").lower() in lower for n in candidate_names if n):
+            return True
+    return False
+
+# -------------------- LLM ARBITER --------------------
 def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> Optional[Dict]:
     if not OPENROUTER_API_KEY:
         return None
@@ -289,7 +340,7 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
     system = (
         "You are a precise, fast support arbiter. "
         "Use ONLY the provided candidates—do not invent routes or answers. "
-        "If intent is unclear, return ONE short clarification question. "
+        "If intent is unclear, return ONE short clarification question that references the relevant option names. "
         "If navigation, pick exactly one candidate route. "
         "If FAQ, return the candidate's 'response'. "
         "Return strict JSON: "
@@ -396,10 +447,6 @@ def seed(req: SeedReq):
 
 @app.post("/seed_append")
 def seed_append(req: SeedReq):
-    """
-    Append-only seeding (does not recreate the collection).
-    Handy for adding FAQs incrementally via Postman.
-    """
     count = upsert_intents_append(req.collection, [i.dict() for i in req.intents])
     return {"ok": True, "count": count}
 
@@ -421,7 +468,7 @@ def smart_search(req: SmartSearchReq):
 # -------------------- High-level ASSIST (context-aware) --------------------
 @app.post("/assist")
 def assist(req: AssistReq):
-    # 0) Try to resolve from prior candidates for short confirmations or name mentions
+    # 0) Try to resolve from prior candidates quickly
     picked_from_prior = None
     if req.prior_candidates:
         picked_from_prior = _select_from_prior(req.prior_candidates, req.text)
@@ -443,7 +490,7 @@ def assist(req: AssistReq):
                     "candidates": req.prior_candidates,
                 }
 
-    # 1) fresh vector search (if not using prior candidate list)
+    # 1) Use prior list if provided; else fresh search
     if req.prior_candidates and not picked_from_prior:
         hits = []
         for h in req.prior_candidates[: req.limit]:
@@ -464,7 +511,7 @@ def assist(req: AssistReq):
         hits = _prefer_role(hits, req.role)
         hits = hits[: req.limit]
 
-    # 2) nothing found → generic clarify
+    # 2) Nothing found → generic clarify
     if not hits:
         return {
             "mode": "clarify",
@@ -472,9 +519,10 @@ def assist(req: AssistReq):
             "route": None,
             "picked": None,
             "candidates": hits,
+            "options": [],
         }
 
-    # 3) adjust ambiguity threshold if there is history (be less naggy)
+    # 3) Ambiguity check (less strict if there is history)
     eff_threshold = req.threshold
     if req.history:
         eff_threshold = max(0.70, req.threshold - 0.06)
@@ -484,21 +532,40 @@ def assist(req: AssistReq):
     if need_arbiter:
         arb = call_arbiter(req.text, hits, context=req.context, history=req.history)
         if arb:
+            # If arbiter says "clarify" but it's too generic, replace with our specific clarification
+            names = [h["payload"].get("name") for h in hits if h["payload"].get("name")]
+            if arb.get("mode") == "clarify" and _too_generic(arb.get("message"), names):
+                clar = _clarify_from_hits(hits)
+                return {
+                    "mode": "clarify",
+                    "message": clar["message"],
+                    "route": None,
+                    "picked": None,
+                    "candidates": hits,
+                    "options": clar["options"],
+                }
+
             picked = None
             if isinstance(arb.get("picked_index"), int):
                 idx = arb["picked_index"]
                 if 0 <= idx < len(hits):
                     picked = hits[idx]["payload"]
             route = arb.get("route") or (picked and picked.get("route"))
-            return {
+
+            resp = {
                 "mode": arb.get("mode", "clarify"),
                 "message": (arb.get("message") or "Can you clarify?").strip(),
                 "route": route,
                 "picked": picked,
                 "candidates": hits,
             }
+            # If clarify and message looks fine, also attach options for UI
+            if resp["mode"] == "clarify":
+                clar = _clarify_from_hits(hits)
+                resp.setdefault("options", clar["options"])
+            return resp
 
-    # 4) clear enough → deterministic pick
+    # 4) Clear enough → deterministic pick
     top = hits[0]["payload"]
     if (top.get("kind") or "nav") == "nav" and top.get("route"):
         return {
