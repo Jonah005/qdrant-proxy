@@ -181,6 +181,16 @@ def _clip_history(history: Optional[List[Dict[str, str]]], max_turns: int = 4) -
     clean = [m for m in history if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)]
     return clean[-max_turns:]
 
+# ---------- NEW: alias builder for arbiter (token-agnostic) ----------
+def _aliases_from_payload(p: Dict) -> str:
+    # derive only from existing fields (no domain-specific tokens)
+    fields = []
+    for key in ("name", "route", "response", "text"):
+        v = p.get(key)
+        if isinstance(v, str) and v.strip():
+            fields.append(v.strip())
+    return " | ".join(fields)[:400]
+
 def _compact_candidates(hits: List[Dict]) -> List[Dict]:
     compact = []
     for i, h in enumerate(hits[:5]):
@@ -194,6 +204,7 @@ def _compact_candidates(hits: List[Dict]) -> List[Dict]:
             "route": p.get("route"),
             "response": p.get("response"),
             "text_example": p.get("text"),
+            "aliases": _aliases_from_payload(p),   # NEW
         })
     return compact
 
@@ -234,6 +245,7 @@ def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
     Heuristics to resolve short follow-ups using previous candidates (no LLM):
     - If text is a confirmation, take top NAV candidate.
     - If text mentions a candidate name token ('pending', 'accepted'), pick that candidate.
+    (Kept for backward-compat; main loop-breaking is handled by arbiter + anti-loop guards.)
     """
     if not prior:
         return None
@@ -329,6 +341,45 @@ def _too_generic(msg: Optional[str], candidate_names: List[str]) -> bool:
             return True
     return False
 
+# ---------- NEW: previous-turn clarify detector ----------
+def _previous_turn_was_clarify(history: Optional[List[Dict[str, str]]]) -> bool:
+    if not history:
+        return False
+    # scan back until we hit the last assistant message or user message
+    for m in reversed(history):
+        role = m.get("role")
+        content = (m.get("content") or "").lower()
+        if role == "assistant":
+            # treat any assistant message containing "clarif" as a clarify turn
+            return "clarif" in content
+        if role == "user":
+            # user turn after assistant; if we didn't find an assistant clarify earlier, return False
+            return False
+    return False
+
+# ---------- NEW: consolidate query after clarify ----------
+def _consolidated_query(req: AssistReq) -> Optional[str]:
+    if not req.history:
+        return None
+    last_user = None
+    prev_user = None
+    last_assistant_clarify = None
+    # look at a small window
+    for m in reversed(req.history[-6:]):
+        r, c = m.get("role"), m.get("content", "")
+        if r == "assistant" and last_assistant_clarify is None and "clarif" in c.lower():
+            last_assistant_clarify = c
+        elif r == "user" and last_user is None:
+            last_user = c
+        elif r == "user" and prev_user is None:
+            prev_user = c
+        if last_user and prev_user and last_assistant_clarify:
+            break
+    if not last_user:
+        return None
+    parts = [p for p in [prev_user, last_assistant_clarify, last_user] if p]
+    return " | ".join(parts) if parts else None
+
 # -------------------- LLM ARBITER --------------------
 def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> Optional[Dict]:
     if not OPENROUTER_API_KEY:
@@ -337,14 +388,19 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
     compact = _compact_candidates(hits)
     topic_hint = _topic_hint_from_hits(hits)
 
+    # STRONGER, DECISIVE PROMPT
     system = (
-        "You are a precise, fast support arbiter. "
-        "Use ONLY the provided candidates—do not invent routes or answers. "
-        "If intent is unclear, return ONE short clarification question that references the relevant option names. "
-        "If navigation, pick exactly one candidate route. "
-        "If FAQ, return the candidate's 'response'. "
-        "Return strict JSON: "
-        "{\"mode\":\"clarify|navigate|answer\",\"message\":\"string\",\"route\":\"string|null\",\"picked_index\":0}"
+        "You are a precise, fast support arbiter.\n"
+        "You MUST choose exactly one of the PROVIDED candidates unless NONE are plausible.\n"
+        "Never invent routes or answers; never introduce new options.\n"
+        "If the user's latest message follows a prior clarification, you MUST decide now unless zero candidates match.\n"
+        "Rules:\n"
+        "1) Prefer the candidate whose NAME/ALIASES semantically matches the latest user message.\n"
+        "2) If the user references an index (1/2/3 or first/second/third), pick that index.\n"
+        "3) Otherwise compare the latest user message with each candidate's NAME/TEXT/ALIASES (case-insensitive), and choose the best match.\n"
+        "4) Only return \"clarify\" if there is truly no way to decide.\n"
+        "Return strict JSON ONLY: "
+        "{\"mode\":\"clarify|navigate|answer\",\"message\":\"string\",\"route\":null|\"/path\",\"picked_index\":0}\n"
     )
 
     messages = [{"role": "system", "content": system}]
@@ -355,8 +411,8 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
     if topic_hint:
         messages.append({"role": "user", "content": f"Topic hint: {topic_hint}"})
 
-    messages.append({"role": "user", "content": f"User query: {user_query}"})
-    messages.append({"role": "user", "content": f"Candidates:\n{json.dumps(compact, ensure_ascii=False)}"})
+    messages.append({"role": "user", "content": f"LATEST user message: {user_query}"})
+    messages.append({"role": "user", "content": f"CANDIDATES (pick one):\n{json.dumps(compact, ensure_ascii=False)}"})
 
     try:
         r = requests.post(
@@ -499,8 +555,15 @@ def assist(req: AssistReq):
         if not hits:
             req.prior_candidates = None
 
+    prev_was_clarify = _previous_turn_was_clarify(req.history)
+
     if not req.prior_candidates:
-        vec = embed_jina([req.text])[0]
+        # Consolidate query if previous turn was a clarify: include brief trail to lift right candidate
+        use_text = req.text
+        cq = _consolidated_query(req)
+        if cq:
+            use_text = f"{req.text} || {cq}"
+        vec = embed_jina([use_text])[0]
         raw_hits = client.search(
             collection_name=req.collection,
             query_vector=vec,
@@ -508,6 +571,9 @@ def assist(req: AssistReq):
             with_payload=True,
         )
         hits = _hits_to_public(raw_hits)
+        # Optional: pre-filter by kind if specified
+        if req.kind:
+            hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == req.kind.lower()]
         hits = _prefer_role(hits, req.role)
         hits = hits[: req.limit]
 
@@ -522,14 +588,30 @@ def assist(req: AssistReq):
             "options": [],
         }
 
-    # 3) Ambiguity check (less strict if there is history)
+    # 2.5) Single-survivor auto-resolve (breaks loops without LLM)
+    filtered = hits
+    if req.kind:
+        filtered = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == req.kind.lower()]
+    if len(filtered) == 1:
+        p = filtered[0]["payload"]
+        if (p.get("kind") or "nav") == "nav" and p.get("route"):
+            return {"mode": "navigate", "message": f"Taking you to {p.get('name')}.",
+                    "route": p["route"], "picked": p, "candidates": hits}
+        if (p.get("kind") or "faq") == "faq" and p.get("response"):
+            return {"mode": "answer", "message": p.get("response"),
+                    "route": None, "picked": p, "candidates": hits}
+
+    # 3) Ambiguity check (less strict if there is history; even less right after clarify)
     eff_threshold = req.threshold
     if req.history:
         eff_threshold = max(0.70, req.threshold - 0.06)
+        if prev_was_clarify:
+            eff_threshold = max(0.60, eff_threshold - 0.10)  # be bolder immediately after a clarify
 
     need_arbiter = req.force_arbiter or _ambiguous(hits, eff_threshold)
 
-    if need_arbiter:
+    # 3.5) If we JUST clarified and it's still ambiguous, prefer deterministic pick to avoid loops
+    if need_arbiter and not prev_was_clarify:
         arb = call_arbiter(req.text, hits, context=req.context, history=req.history)
         if arb:
             # If arbiter says "clarify" but it's too generic, replace with our specific clarification
@@ -564,6 +646,26 @@ def assist(req: AssistReq):
                 clar = _clarify_from_hits(hits)
                 resp.setdefault("options", clar["options"])
             return resp
+
+    # If previous turn was clarify and we're still here (or arbiter kept clarifying), break the loop deterministically
+    if prev_was_clarify:
+        top = hits[0]["payload"]
+        if (top.get("kind") or "nav") == "nav" and top.get("route"):
+            return {
+                "mode": "navigate",
+                "message": f"Taking you to {top.get('name')}.",
+                "route": top.get("route"),
+                "picked": top,
+                "candidates": hits,
+            }
+        if (top.get("kind") or "faq") == "faq" and top.get("response"):
+            return {
+                "mode": "answer",
+                "message": top.get("response"),
+                "route": None,
+                "picked": top,
+                "candidates": hits,
+            }
 
     # 4) Clear enough → deterministic pick
     top = hits[0]["payload"]
