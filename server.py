@@ -548,6 +548,38 @@ def smart_search(req: SmartSearchReq):
     hits = _prefer_role(hits, req.role)
     return hits[:req.limit]
 
+# ---------- consolidate query after clarify ----------
+def _consolidated_query(req: AssistReq) -> Optional[str]:
+    """
+    Build a short synthetic query using the last assistant clarify + the last two user turns.
+    This boosts the right candidate after the user has already clarified.
+    """
+    if not req.history:
+        return None
+
+    last_user = None
+    prev_user = None
+    last_assistant_clarify = None
+
+    # Look back a small window of recent turns
+    for m in reversed(req.history[-6:]):
+        role = m.get("role")
+        content = m.get("content", "")
+        if role == "assistant" and last_assistant_clarify is None and "clarif" in content.lower():
+            last_assistant_clarify = content
+        elif role == "user" and last_user is None:
+            last_user = content
+        elif role == "user" and prev_user is None:
+            prev_user = content
+        if last_user and prev_user and last_assistant_clarify:
+            break
+
+    if not last_user:
+        return None
+
+    parts = [p for p in (prev_user, last_assistant_clarify, last_user) if p]
+    return " | ".join(parts) if parts else None
+    
 # -------------------- High-level ASSIST (context-aware) --------------------
 @app.post("/assist")
 def assist(req: AssistReq):
