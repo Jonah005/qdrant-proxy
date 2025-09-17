@@ -1,8 +1,9 @@
-import os, json, requests, re
+import os, json, requests, re, traceback
 from typing import List, Dict, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
@@ -32,6 +33,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------------------- GLOBAL ERROR HANDLER --------------------
+@app.exception_handler(Exception)
+async def _unhandled_error(request: Request, exc: Exception):
+    tb = traceback.format_exc(limit=2)
+    print("UNHANDLED ERROR:", tb)
+    return JSONResponse(
+        status_code=500,
+        content={"ok": False, "error": type(exc).__name__, "detail": str(exc), "where": request.url.path},
+    )
 
 # -------------------- MODELS --------------------
 class UpsertItem(BaseModel):
@@ -128,10 +139,6 @@ def upsert_intents(collection: str, dim: int, intents: List[Dict]) -> int:
     return len(points)
 
 def upsert_intents_append(collection: str, intents: List[Dict]) -> int:
-    """
-    Append-only upsert (does NOT recreate the collection).
-    Assumes dim=1024 & COSINE from earlier create; will just add new points.
-    """
     items, texts = [], []
     for intent in intents:
         for phrase in intent["phrases"]:
@@ -145,7 +152,7 @@ def upsert_intents_append(collection: str, intents: List[Dict]) -> int:
             })
             texts.append(phrase)
 
-    BASE = 1_000_000  # simple large base to avoid ID collisions
+    BASE = 1_000_000
     vecs = embed_jina(texts)
     points = [qm.PointStruct(id=BASE + i, vector=vecs[i], payload=items[i]) for i in range(len(items))]
     client.upsert(collection_name=collection, points=points)
@@ -262,26 +269,17 @@ def _safe_json_loads(s: str) -> Optional[Dict]:
 _CONFIRM_RE = re.compile(r"\b(ok(ay)?|yes|ya|sure|please|go|take me|proceed|do it)\b", re.I)
 
 def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
-    """
-    Heuristics to resolve short follow-ups using previous candidates (no LLM):
-    - If text is a confirmation, take top NAV candidate.
-    - If text mentions a candidate name token ('pending', 'accepted'), pick that candidate.
-    """
     if not prior:
         return None
-
     def to_payload(h):
         return h["payload"] if "payload" in h else h
-
     payloads = [to_payload(h) for h in prior]
-
     if _CONFIRM_RE.search(text or ""):
         for h in prior:
             p = to_payload(h)
             if (p.get("kind") or "nav") == "nav" and p.get("route"):
                 return p
         return payloads[0]
-
     t = (text or "").lower()
     for p in payloads:
         name = (p.get("name") or "").lower()
@@ -289,7 +287,7 @@ def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
             return p
     return None
 
-# ---------- better clarification generator ----------
+# ---------- clarification generator ----------
 def _human_join(items: List[str]) -> str:
     items = [s for s in items if s]
     if not items:
@@ -312,15 +310,12 @@ def _clarify_from_hits(hits: List[Dict]) -> Dict[str, object]:
             continue
         seen.add(key)
         tops.append(h)
-
     options = [{
         "name": t["payload"].get("name"),
         "kind": t["payload"].get("kind"),
         "route": t["payload"].get("route"),
     } for t in tops]
-
     names = [t["payload"].get("name") for t in tops if t["payload"].get("name")]
-
     if not names:
         message = "Do you want me to open a page or explain something about your orders?"
     elif len(names) == 1:
@@ -329,7 +324,6 @@ def _clarify_from_hits(hits: List[Dict]) -> Dict[str, object]:
         message = f"Do you want {_human_join(names)}?"
     else:
         message = f"Which one do you want: {_human_join(names)}?"
-
     return {"message": message, "options": options}
 
 _GENERIC_PHRASES = re.compile(r"(clarify|specify|which one|what do you mean|more details|elaborate)", re.I)
@@ -350,7 +344,6 @@ _CLARIFY_CUES = re.compile(
     r"\b(clarif(y|ication)|which one|do you want|did you mean|choose|select|pick|open one|should I open|which (page|option))\b",
     re.I,
 )
-
 _ORDINAL_MAP = {
     "1": 0, "one": 0, "first": 0,
     "2": 1, "two": 1, "second": 1,
@@ -379,19 +372,16 @@ def _tokenize(s: str) -> List[str]:
     return [t for t in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(t) >= 3]
 
 def _pick_by_reply_text(text: Optional[str], hits: List[Dict]) -> Optional[int]:
-    """Pick a candidate by user reply content (index or name/alias overlap)."""
     if not text or not hits:
         return None
     t = (text or "").lower().strip()
-
-    # 1) index/ordinal
+    # by index/ordinal
     for word in re.findall(r"[a-z0-9]+", t):
         if word in _ORDINAL_MAP:
             idx = _ORDINAL_MAP[word]
             if 0 <= idx < len(hits):
                 return idx
-
-    # 2) name/alias overlap
+    # by name/alias overlap
     scores = []
     for i, h in enumerate(hits):
         p = h["payload"]
@@ -399,22 +389,15 @@ def _pick_by_reply_text(text: Optional[str], hits: List[Dict]) -> Optional[int]:
         text_example = (p.get("text") or "")
         route = (p.get("route") or "")
         candidate_blob = " ".join([name, text_example, route]).lower()
-
-        # full name mention
         full_hit = 1 if name and name.lower() in t else 0
-
-        # token overlap
         toks = set(_tokenize(name) + _tokenize(text_example) + _tokenize(route))
         overlap = sum(1 for tok in toks if tok in t)
-
-        scores.append((full_hit * 10 + overlap, i))  # prefer explicit full name
+        scores.append((full_hit * 10 + overlap, i))
     scores.sort(reverse=True)
     if not scores:
         return None
     best_score, best_idx = scores[0]
     second_score = scores[1][0] if len(scores) > 1 else -1
-
-    # require at least some overlap, and be clearly better than runner-up
     if best_score >= 1 and best_score >= second_score + 1:
         return best_idx
     return None
@@ -482,6 +465,10 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
         return None
 
 # -------------------- ENDPOINTS --------------------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "qdrant-proxy", "routes": [r.path for r in app.routes]}
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -563,177 +550,196 @@ def smart_search(req: SmartSearchReq):
 # -------------------- High-level ASSIST (context-aware) --------------------
 @app.post("/assist")
 def assist(req: AssistReq):
-    hits: List[Dict] = []  # ensure defined
+    try:
+        hits: List[Dict] = []
 
-    # 0) Try to resolve from prior candidates quickly
-    picked_from_prior = None
-    if req.prior_candidates:
-        picked_from_prior = _select_from_prior(req.prior_candidates, req.text)
-        if picked_from_prior:
-            if (picked_from_prior.get("kind") or "nav") == "nav" and picked_from_prior.get("route"):
+        # 0) Try to resolve from prior candidates quickly
+        picked_from_prior = None
+        if req.prior_candidates:
+            picked_from_prior = _select_from_prior(req.prior_candidates, req.text)
+            if picked_from_prior:
+                if (picked_from_prior.get("kind") or "nav") == "nav" and picked_from_prior.get("route"):
+                    return {
+                        "mode": "navigate",
+                        "message": f"Taking you to {picked_from_prior.get('name')}.",
+                        "route": picked_from_prior.get("route"),
+                        "picked": picked_from_prior,
+                        "candidates": req.prior_candidates,
+                    }
+                if (picked_from_prior.get("kind") or "faq") == "faq" and picked_from_prior.get("response"):
+                    return {
+                        "mode": "answer",
+                        "message": picked_from_prior.get("response"),
+                        "route": None,
+                        "picked": picked_from_prior,
+                        "candidates": req.prior_candidates,
+                    }
+
+        # 1) Use prior list if provided; else fresh search
+        if req.prior_candidates and not picked_from_prior:
+            hits = []
+            for h in req.prior_candidates[: req.limit]:
+                if isinstance(h, dict) and "payload" in h and "score" in h:
+                    hits.append({"score": float(h["score"]), "payload": dict(h["payload"])})
+            if not hits:
+                req.prior_candidates = None
+
+        prev_was_clarify = _previous_turn_was_clarify(req.history)
+
+        if not req.prior_candidates:
+            # Consolidate query if previous turn was a clarify
+            use_text = req.text
+            cq = _consolidated_query(req)
+            if cq:
+                use_text = f"{req.text} || {cq}"
+            vec = embed_jina([use_text])[0]
+            raw_hits = client.search(
+                collection_name=req.collection,
+                query_vector=vec,
+                limit=max(req.limit, 10),
+                with_payload=True,
+            )
+            hits = _hits_to_public(raw_hits)
+            if req.kind:
+                hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == req.kind.lower()]
+            hits = _prefer_role(hits, req.role)
+            hits = hits[: req.limit]
+
+        # 2) Nothing found → generic clarify
+        if not hits:
+            return {
+                "mode": "clarify",
+                "message": "I couldn’t match that. Do you want to open a page or ask a question about orders?",
+                "route": None,
+                "picked": None,
+                "candidates": hits,
+                "options": [],
+            }
+
+        # A) If user reply names an option (or index), pick it immediately
+        picked_idx_from_reply = _pick_by_reply_text(req.text, hits)
+        if picked_idx_from_reply is not None:
+            p = hits[picked_idx_from_reply]["payload"]
+            if (p.get("kind") or "nav") == "nav" and p.get("route"):
                 return {
                     "mode": "navigate",
-                    "message": f"Taking you to {picked_from_prior.get('name')}.",
-                    "route": picked_from_prior.get("route"),
-                    "picked": picked_from_prior,
-                    "candidates": req.prior_candidates,
+                    "message": f"Taking you to {p.get('name')}.",
+                    "route": p["route"],
+                    "picked": p,
+                    "candidates": hits,
                 }
-            if (picked_from_prior.get("kind") or "faq") == "faq" and picked_from_prior.get("response"):
+            if (p.get("kind") or "faq") == "faq" and p.get("response"):
                 return {
                     "mode": "answer",
-                    "message": picked_from_prior.get("response"),
+                    "message": p["response"],
                     "route": None,
-                    "picked": picked_from_prior,
-                    "candidates": req.prior_candidates,
-                }
-
-    # 1) Use prior list if provided; else fresh search
-    if req.prior_candidates and not picked_from_prior:
-        hits = []
-        for h in req.prior_candidates[: req.limit]:
-            if isinstance(h, dict) and "payload" in h and "score" in h:
-                hits.append({"score": float(h["score"]), "payload": dict(h["payload"])})
-        if not hits:
-            req.prior_candidates = None
-
-    prev_was_clarify = _previous_turn_was_clarify(req.history)
-
-    if not req.prior_candidates:
-        # Consolidate query if previous turn was a clarify
-        use_text = req.text
-        cq = _consolidated_query(req)
-        if cq:
-            use_text = f"{req.text} || {cq}"
-        vec = embed_jina([use_text])[0]
-        raw_hits = client.search(
-            collection_name=req.collection,
-            query_vector=vec,
-            limit=max(req.limit, 10),
-            with_payload=True,
-        )
-        hits = _hits_to_public(raw_hits)
-        if req.kind:
-            hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == req.kind.lower()]
-        hits = _prefer_role(hits, req.role)
-        hits = hits[: req.limit]
-
-    # 2) Nothing found → generic clarify
-    if not hits:
-        return {
-            "mode": "clarify",
-            "message": "I couldn’t match that. Do you want to open a page or ask a question about orders?",
-            "route": None,
-            "picked": None,
-            "candidates": hits,
-            "options": [],
-        }
-
-    # ----- NEW: If user reply names an option (or index), pick it immediately
-    picked_idx_from_reply = _pick_by_reply_text(req.text, hits)
-    if picked_idx_from_reply is not None:
-        p = hits[picked_idx_from_reply]["payload"]
-        if (p.get("kind") or "nav") == "nav" and p.get("route"):
-            return {
-                "mode": "navigate",
-                "message": f"Taking you to {p.get('name')}.",
-                "route": p["route"],
-                "picked": p,
-                "candidates": hits,
-            }
-        if (p.get("kind") or "faq") == "faq" and p.get("response"):
-            return {
-                "mode": "answer",
-                "message": p["response"],
-                "route": None,
-                "picked": p,
-                "candidates": hits,
-            }
-    # ----- END NEW
-
-    # ---------- steer questions away from navigation ----------
-    intent_hint = _intent_hint_from_text(req.text)
-    if intent_hint == "question":
-        faq_hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == "faq"]
-        if faq_hits and faq_hits[0]["payload"].get("response"):
-            p = faq_hits[0]["payload"]
-            return {
-                "mode": "answer",
-                "message": p["response"],
-                "route": None,
-                "picked": p,
-                "candidates": hits,
-            }
-        clar = _clarify_from_hits(hits)
-        return {
-            "mode": "clarify",
-            "message": clar["message"],
-            "route": None,
-            "picked": None,
-            "candidates": hits,
-            "options": clar["options"],
-        }
-
-    # 2.5) Single-survivor auto-resolve
-    filtered = hits
-    if req.kind:
-        filtered = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == req.kind.lower()]
-    if len(filtered) == 1:
-        p = filtered[0]["payload"]
-        if (p.get("kind") or "nav") == "nav" and p.get("route"):
-            return {"mode": "navigate", "message": f"Taking you to {p.get('name')}.",
-                    "route": p["route"], "picked": p, "candidates": hits}
-        if (p.get("kind") or "faq") == "faq" and p.get("response"):
-            return {"mode": "answer", "message": p.get("response"),
-                    "route": None, "picked": p, "candidates": hits}
-
-    # 3) Ambiguity check (less strict if history; even less right after clarify)
-    eff_threshold = req.threshold
-    if req.history:
-        eff_threshold = max(0.70, req.threshold - 0.06)
-        if prev_was_clarify:
-            eff_threshold = max(0.60, eff_threshold - 0.10)
-
-    need_arbiter = req.force_arbiter or _ambiguous(hits, eff_threshold)
-
-    # 3.5) Arbiter (but avoid clarify loops)
-    if need_arbiter and not prev_was_clarify:
-        arb = call_arbiter(req.text, hits, context=req.context, history=req.history)
-        if arb:
-            names = [h["payload"].get("name") for h in hits if h["payload"].get("name")]
-            if arb.get("mode") == "clarify" and _too_generic(arb.get("message"), names):
-                clar = _clarify_from_hits(hits)
-                return {
-                    "mode": "clarify",
-                    "message": clar["message"],
-                    "route": None,
-                    "picked": None,
+                    "picked": p,
                     "candidates": hits,
-                    "options": clar["options"],
                 }
 
-            picked = None
-            if isinstance(arb.get("picked_index"), int):
-                idx = arb["picked_index"]
-                if 0 <= idx < len(hits):
-                    picked = hits[idx]["payload"]
-            route = arb.get("route") or (picked and picked.get("route"))
-
-            resp = {
-                "mode": arb.get("mode", "clarify"),
-                "message": (arb.get("message") or "Can you clarify?").strip(),
-                "route": route,
-                "picked": picked,
+        # B) steer questions away from navigation
+        intent_hint = _intent_hint_from_text(req.text)
+        if intent_hint == "question":
+            faq_hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == "faq"]
+            if faq_hits and faq_hits[0]["payload"].get("response"):
+                p = faq_hits[0]["payload"]
+                return {
+                    "mode": "answer",
+                    "message": p["response"],
+                    "route": None,
+                    "picked": p,
+                    "candidates": hits,
+                }
+            clar = _clarify_from_hits(hits)
+            return {
+                "mode": "clarify",
+                "message": clar["message"],
+                "route": None,
+                "picked": None,
                 "candidates": hits,
+                "options": clar["options"],
             }
-            if resp["mode"] == "clarify":
-                clar = _clarify_from_hits(hits)
-                resp.setdefault("options", clar["options"])
-            return resp
 
-    # If previous turn was clarify and we're still here, be decisive to break loops
-    if prev_was_clarify:
+        # 2.5) Single-survivor auto-resolve
+        filtered = hits
+        if req.kind:
+            filtered = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == req.kind.lower()]
+        if len(filtered) == 1:
+            p = filtered[0]["payload"]
+            if (p.get("kind") or "nav") == "nav" and p.get("route"):
+                return {"mode": "navigate", "message": f"Taking you to {p.get('name')}.",
+                        "route": p["route"], "picked": p, "candidates": hits}
+            if (p.get("kind") or "faq") == "faq" and p.get("response"):
+                return {"mode": "answer", "message": p.get("response"),
+                        "route": None, "picked": p, "candidates": hits}
+
+        # 3) Ambiguity check
+        eff_threshold = req.threshold
+        if req.history:
+            eff_threshold = max(0.70, req.threshold - 0.06)
+            if prev_was_clarify:
+                eff_threshold = max(0.60, eff_threshold - 0.10)
+        need_arbiter = req.force_arbiter or _ambiguous(hits, eff_threshold)
+
+        # 3.5) Arbiter (avoid clarify loops)
+        if need_arbiter and not prev_was_clarify:
+            arb = call_arbiter(req.text, hits, context=req.context, history=req.history)
+            if arb:
+                names = [h["payload"].get("name") for h in hits if h["payload"].get("name")]
+                if arb.get("mode") == "clarify" and _too_generic(arb.get("message"), names):
+                    clar = _clarify_from_hits(hits)
+                    return {
+                        "mode": "clarify",
+                        "message": clar["message"],
+                        "route": None,
+                        "picked": None,
+                        "candidates": hits,
+                        "options": clar["options"],
+                    }
+
+                picked = None
+                if isinstance(arb.get("picked_index"), int):
+                    idx = arb["picked_index"]
+                    if 0 <= idx < len(hits):
+                        picked = hits[idx]["payload"]
+                route = arb.get("route") or (picked and picked.get("route"))
+
+                resp = {
+                    "mode": arb.get("mode", "clarify"),
+                    "message": (arb.get("message") or "Can you clarify?").strip(),
+                    "route": route,
+                    "picked": picked,
+                    "candidates": hits,
+                }
+                if resp["mode"] == "clarify":
+                    clar = _clarify_from_hits(hits)
+                    resp.setdefault("options", clar["options"])
+                return resp
+
+        # If previous turn was clarify and we're still here, be decisive
+        if prev_was_clarify:
+            top = hits[0]["payload"]
+            if (top.get("kind") or "nav") == "nav" and top.get("route"):
+                return {
+                    "mode": "navigate",
+                    "message": f"Taking you to {top.get('name')}.",
+                    "route": top.get("route"),
+                    "picked": top,
+                    "candidates": hits,
+                }
+            if (top.get("kind") or "faq") == "faq" and top.get("response"):
+                return {
+                    "mode": "answer",
+                    "message": top.get("response"),
+                    "route": None,
+                    "picked": top,
+                    "candidates": hits,
+                }
+
+        # 4) Default deterministic pick
         top = hits[0]["payload"]
-        if (top.get("kind") or "nav") == "nav" and top.get("route"):
+        questiony = (_intent_hint_from_text(req.text) == "question")
+        if (top.get("kind") or "nav") == "nav" and top.get("route") and not questiony:
             return {
                 "mode": "navigate",
                 "message": f"Taking you to {top.get('name')}.",
@@ -750,34 +756,20 @@ def assist(req: AssistReq):
                 "candidates": hits,
             }
 
-    # 4) Clear enough → deterministic pick
-    top = hits[0]["payload"]
-    questiony = (_intent_hint_from_text(req.text) == "question")
-
-    if (top.get("kind") or "nav") == "nav" and top.get("route") and not questiony:
         return {
-            "mode": "navigate",
-            "message": f"Taking you to {top.get('name')}.",
+            "mode": "fallback",
+            "message": "I found a likely match but cannot complete the action automatically.",
             "route": top.get("route"),
             "picked": top,
             "candidates": hits,
         }
-    if (top.get("kind") or "faq") == "faq" and top.get("response"):
-        return {
-            "mode": "answer",
-            "message": top.get("response"),
-            "route": None,
-            "picked": top,
-            "candidates": hits,
-        }
-
-    return {
-        "mode": "fallback",
-        "message": "I found a likely match but cannot complete the action automatically.",
-        "route": top.get("route"),
-        "picked": top,
-        "candidates": hits,
-    }
+    except Exception as e:
+        tb = traceback.format_exc(limit=2)
+        print("ASSIST ERROR:", tb)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": type(e).__name__, "detail": str(e)},
+        )
 
 # -------------------- AUTO-SEED --------------------
 @app.on_event("startup")
