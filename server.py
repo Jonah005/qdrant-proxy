@@ -20,7 +20,7 @@ ARBITER_MODEL = os.getenv(
     "mistralai/mistral-small-3.2-24b-instruct:free",
 ).strip()
 
-VERSION = "assist-qa-guard-2025-09-17"
+VERSION = "assist-qa-guard-2025-09-17b"
 
 # -------------------- CLIENTS / APP --------------------
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -31,6 +31,10 @@ app.add_middleware(
     allow_origins=[
         "https://smbshopper1.pythonanywhere.com",
         "https://www.smbshopper1.pythonanywhere.com",
+        # add localhost/dev here if needed
+        "http://localhost",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -391,7 +395,6 @@ def _pick_by_reply_text(text: Optional[str], hits: List[Dict]) -> Optional[int]:
         name = (p.get("name") or "")
         text_example = (p.get("text") or "")
         route = (p.get("route") or "")
-        candidate_blob = " ".join([name, text_example, route]).lower()
         full_hit = 1 if name and name.lower() in t else 0
         toks = set(_tokenize(name) + _tokenize(text_example) + _tokenize(route))
         overlap = sum(1 for tok in toks if tok in t)
@@ -405,7 +408,7 @@ def _pick_by_reply_text(text: Optional[str], hits: List[Dict]) -> Optional[int]:
         return best_idx
     return None
 
-# -------------------- LLM ARBITER --------------------
+# -------------------- ARBITER --------------------
 def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> Optional[Dict]:
     if not OPENROUTER_API_KEY:
         return None
@@ -413,7 +416,7 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
     compact = _compact_candidates(hits)
     topic_hint = _topic_hint_from_hits(hits)
 
-    # few-shot style examples (very short to stay within token budget)
+    # few-shot examples to push the model toward our desired decisions
     examples = (
         "EXAMPLES:\n"
         "User: 'open the first'\n"
@@ -432,7 +435,7 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
         "Rules:\n"
         "1) Prefer the candidate whose NAME/ALIASES semantically matches the latest user message.\n"
         "2) If the user references an index (1/2/3 or first/second/third), pick that index.\n"
-        "3) Otherwise compare the latest user message with each candidate's NAME/TEXT/ALIASES (case-insensitive), and choose the best match.\n"
+        "3) Otherwise compare the latest user message with each candidate's NAME/TEXT/ALIASES, and choose the best match.\n"
         "4) Only return \"clarify\" if there is truly no way to decide.\n"
         "5) If the user's message looks like a question (contains '?' or what/why/how/etc.), PREFER 'answer' over 'navigate' when any FAQ candidate is plausible.\n"
         "Return strict JSON ONLY: "
@@ -592,6 +595,22 @@ def _consolidated_query(req: AssistReq) -> Optional[str]:
     parts = [p for p in (prev_user, last_assistant_clarify, last_user) if p]
     return " | ".join(parts) if parts else None
 
+# ---------- history snippet even when there was NO clarify ----------
+def _history_snippet(req: AssistReq, max_chars: int = 240) -> str:
+    """
+    Join the last few user+assistant turns to give retrieval more context
+    even if there wasn't a clarification in the previous turn.
+    """
+    if not req.history:
+        return ""
+    window = []
+    for m in _clip_history(req.history, max_turns=4):
+        r = m.get("role"); c = (m.get("content") or "").strip()
+        if r in ("user", "assistant") and c:
+            window.append(f"{r[:1]}:{c}")
+    joined = " | ".join(window)
+    return joined[-max_chars:] if len(joined) > max_chars else joined
+
 # -------------------- High-level ASSIST --------------------
 @app.post("/assist")
 def assist(req: AssistReq):
@@ -617,7 +636,7 @@ def assist(req: AssistReq):
                             "picked": picked_from_prior,
                             "candidates": req.prior_candidates,
                         }
-                        if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "prior_nav"}
+                        if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "prior_nav", "version": VERSION}
                         return resp
                     if (picked_from_prior.get("kind") or "faq") == "faq" and picked_from_prior.get("response"):
                         resp = {
@@ -627,7 +646,7 @@ def assist(req: AssistReq):
                             "picked": picked_from_prior,
                             "candidates": req.prior_candidates,
                         }
-                        if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "prior_faq"}
+                        if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "prior_faq", "version": VERSION}
                         return resp
 
         # 1) Use prior list if provided; else fresh search
@@ -640,10 +659,14 @@ def assist(req: AssistReq):
                 req.prior_candidates = None
 
         if not req.prior_candidates:
+            # Include history signal even if there wasn't a clarify last turn
             use_text = req.text
+            hist = _history_snippet(req)
+            if hist:
+                use_text = f"{use_text} || hist: {hist}"
             cq = _consolidated_query(req)
             if cq:
-                use_text = f"{req.text} || {cq}"
+                use_text = f"{use_text} || after-clarify: {cq}"
             vec = embed_jina([use_text])[0]
             raw_hits = client.search(
                 collection_name=req.collection,
@@ -667,7 +690,7 @@ def assist(req: AssistReq):
                 "candidates": hits,
                 "options": [],
             }
-            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "no_hits"}
+            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "no_hits", "version": VERSION}
             return resp
 
         # A) If user reply names an option (or index), pick it immediately
@@ -677,11 +700,11 @@ def assist(req: AssistReq):
             if (p.get("kind") or "nav") == "nav" and p.get("route") and intent_hint != "question":
                 resp = {"mode": "navigate", "message": f"Taking you to {p.get('name')}.",
                         "route": p["route"], "picked": p, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "reply_pick_nav"}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "reply_pick_nav", "version": VERSION}
                 return resp
             if (p.get("kind") or "faq") == "faq" and p.get("response"):
                 resp = {"mode": "answer", "message": p["response"], "route": None, "picked": p, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "reply_pick_faq"}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "reply_pick_faq", "version": VERSION}
                 return resp
 
         # B) steer questions away from navigation
@@ -690,12 +713,12 @@ def assist(req: AssistReq):
             if faq_hits and faq_hits[0]["payload"].get("response"):
                 p = faq_hits[0]["payload"]
                 resp = {"mode": "answer", "message": p["response"], "route": None, "picked": p, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_faq"}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_faq", "version": VERSION}
                 return resp
             clar = _clarify_from_hits(hits)
             resp = {"mode": "clarify", "message": clar["message"], "route": None,
                     "picked": None, "candidates": hits, "options": clar["options"]}
-            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_clarify"}
+            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_clarify", "version": VERSION}
             return resp
 
         # 2.5) Single-survivor auto-resolve (non-question only)
@@ -707,12 +730,12 @@ def assist(req: AssistReq):
             if (p.get("kind") or "nav") == "nav" and p.get("route"):
                 resp = {"mode": "navigate", "message": f"Taking you to {p.get('name')}.",
                         "route": p["route"], "picked": p, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "single_nav"}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "single_nav", "version": VERSION}
                 return resp
             if (p.get("kind") or "faq") == "faq" and p.get("response"):
                 resp = {"mode": "answer", "message": p.get("response"),
                         "route": None, "picked": p, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "single_faq"}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "single_faq", "version": VERSION}
                 return resp
 
         # 3) Ambiguity check
@@ -732,7 +755,7 @@ def assist(req: AssistReq):
                     clar = _clarify_from_hits(hits)
                     resp = {"mode": "clarify", "message": clar["message"], "route": None,
                             "picked": None, "candidates": hits, "options": clar["options"]}
-                    if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "arbiter_generic"}
+                    if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "arbiter_generic", "version": VERSION}
                     return resp
 
                 picked = None
@@ -747,13 +770,13 @@ def assist(req: AssistReq):
                     clar = _clarify_from_hits(hits)
                     resp = {"mode": "clarify", "message": clar["message"], "route": None,
                             "picked": None, "candidates": hits, "options": clar["options"]}
-                    if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "arbiter_nav_blocked"}
+                    if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "arbiter_nav_blocked", "version": VERSION}
                     return resp
 
                 resp = {"mode": arb.get("mode", "clarify"),
                         "message": (arb.get("message") or "Can you clarify?").strip(),
                         "route": route, "picked": picked, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "arbiter"}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "arbiter", "version": VERSION}
                 if resp["mode"] == "clarify":
                     clar = _clarify_from_hits(hits)
                     resp.setdefault("options", clar["options"])
@@ -765,12 +788,12 @@ def assist(req: AssistReq):
             if (top.get("kind") or "nav") == "nav" and top.get("route"):
                 resp = {"mode": "navigate", "message": f"Taking you to {top.get('name')}.",
                         "route": top.get("route"), "picked": top, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "post_clarify_nav"}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "post_clarify_nav", "version": VERSION}
                 return resp
             if (top.get("kind") or "faq") == "faq" and top.get("response"):
                 resp = {"mode": "answer", "message": top.get("response"),
                         "route": None, "picked": top, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "post_clarify_faq"}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "post_clarify_faq", "version": VERSION}
                 return resp
 
         # 4) Default deterministic pick (non-question only)
@@ -778,18 +801,18 @@ def assist(req: AssistReq):
         if (top.get("kind") or "nav") == "nav" and top.get("route") and intent_hint != "question":
             resp = {"mode": "navigate", "message": f"Taking you to {top.get('name')}.",
                     "route": top.get("route"), "picked": top, "candidates": hits}
-            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "deterministic_nav"}
+            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "deterministic_nav", "version": VERSION}
             return resp
         if (top.get("kind") or "faq") == "faq" and top.get("response"):
             resp = {"mode": "answer", "message": top.get("response"),
                     "route": None, "picked": top, "candidates": hits}
-            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "deterministic_faq"}
+            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "deterministic_faq", "version": VERSION}
             return resp
 
         resp = {"mode": "fallback",
                 "message": "I found a likely match but cannot complete the action automatically.",
                 "route": top.get("route"), "picked": top, "candidates": hits}
-        if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "fallback"}
+        if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "fallback", "version": VERSION}
         return resp
 
     except Exception as e:
@@ -840,6 +863,20 @@ def startup_seed():
                 "what new orders are available",
                 "orders I can accept",
             ],
+        },
+        # ---- helpful FAQ so questions get answered instead of navigating
+        {
+            "name": "What do Pending vs Accepted mean?",
+            "role": "customer",
+            "kind": "faq",
+            "phrases": [
+                "what is the difference between pending and accepted orders",
+                "what does pending orders mean",
+                "explain accepted vs pending",
+                "what is this orders?",
+                "what are these orders?",
+            ],
+            "response": "Pending Orders are requests a shop hasn’t accepted yet. Accepted Orders are the ones a shop approved and is moving forward with."
         },
     ]
     upsert_intents("ai_actions_v1", 1024, intents)
