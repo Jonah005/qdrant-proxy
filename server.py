@@ -20,7 +20,7 @@ ARBITER_MODEL = os.getenv(
     "mistralai/mistral-small-3.2-24b-instruct:free",
 ).strip()
 
-VERSION = "assist-qa-guard-2025-09-17b"
+VERSION = "assist-qa-guard-2025-09-17c"
 
 # -------------------- CLIENTS / APP --------------------
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -31,7 +31,6 @@ app.add_middleware(
     allow_origins=[
         "https://smbshopper1.pythonanywhere.com",
         "https://www.smbshopper1.pythonanywhere.com",
-        # add localhost/dev here if needed
         "http://localhost",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
@@ -87,12 +86,11 @@ class AssistReq(BaseModel):
     limit: int = 5
     threshold: float = 0.80
     force_arbiter: bool = False
-    # Lightweight context across turns
-    context: Optional[str] = None                  # short line like "We discussed pending vs accepted"
-    history: Optional[List[Dict[str, str]]] = None # [{role:'user'|'assistant', content:'...'}]
-    prior_candidates: Optional[List[Dict]] = None  # last /assist "candidates"
+    context: Optional[str] = None
+    history: Optional[List[Dict[str, str]]] = None
+    prior_candidates: Optional[List[Dict]] = None
     kind: Optional[str] = None
-    debug: Optional[bool] = False                  # optional debug hints in responses
+    debug: Optional[bool] = False
 
 # -------------------- HELPERS --------------------
 def embed_jina(texts: List[str]) -> List[List[float]]:
@@ -196,9 +194,18 @@ def _clip_history(history: Optional[List[Dict[str, str]]], max_turns: int = 4) -
     clean = [m for m in history if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)]
     return clean[-max_turns:]
 
-# ---------- intent hints: question vs action ----------
+# ---------- intent hints ----------
 QUESTION_WORDS = re.compile(r"\b(what|why|how|when|which|who|where|meaning|explain|difference|help)\b", re.I)
 ACTION_WORDS   = re.compile(r"\b(show|open|go to|navigate|take me|list|display|see|view|find)\b", re.I)
+NAV_QUESTION_RE = re.compile(
+    r"\b("
+    r"where(\s+do|\s+can)?\s+(i\s+)?(go|find|see|view|get)"
+    r"|which\s+page"
+    r"|how\s+(do|to)\s+(i\s+)?(see|view|find|get\s+to|open)"
+    r"|navigate|go\s+to|open"
+    r")\b",
+    re.I,
+)
 
 def _looks_like_question(text: Optional[str]) -> bool:
     t = (text or "").strip().lower()
@@ -211,6 +218,9 @@ def _looks_like_action(text: Optional[str]) -> bool:
 def _intent_hint_from_text(text: Optional[str]) -> str:
     q = _looks_like_question(text)
     a = _looks_like_action(text)
+    nav_q = bool(NAV_QUESTION_RE.search(text or ""))
+    if q and nav_q:
+        return "question_nav"   # question phrased, but navigation intent
     if q and not a:
         return "question"
     if a and not q:
@@ -294,7 +304,7 @@ def _select_from_prior(prior: List[Dict], text: str) -> Optional[Dict]:
             return p
     return None
 
-# ---------- clarification generator ----------
+# ---------- clarification helpers ----------
 def _human_join(items: List[str]) -> str:
     items = [s for s in items if s]
     if not items:
@@ -321,6 +331,7 @@ def _clarify_from_hits(hits: List[Dict]) -> Dict[str, object]:
         "name": t["payload"].get("name"),
         "kind": t["payload"].get("kind"),
         "route": t["payload"].get("route"),
+        "role": t["payload"].get("role"),
     } for t in tops]
     names = [t["payload"].get("name") for t in tops if t["payload"].get("name")]
     if not names:
@@ -382,13 +393,11 @@ def _pick_by_reply_text(text: Optional[str], hits: List[Dict]) -> Optional[int]:
     if not text or not hits:
         return None
     t = (text or "").lower().strip()
-    # by index/ordinal
     for word in re.findall(r"[a-z0-9]+", t):
         if word in _ORDINAL_MAP:
             idx = _ORDINAL_MAP[word]
             if 0 <= idx < len(hits):
                 return idx
-    # by name/alias overlap
     scores = []
     for i, h in enumerate(hits):
         p = h["payload"]
@@ -408,6 +417,26 @@ def _pick_by_reply_text(text: Optional[str], hits: List[Dict]) -> Optional[int]:
         return best_idx
     return None
 
+# ---------- FAQ relevance guard ----------
+def _faq_is_relevant(user_text: str, faq_payload: Dict) -> bool:
+    """
+    Only let an FAQ auto-answer if the user text overlaps with the FAQ topic.
+    Very light lexical guard to avoid answering unrelated 'where' questions with a definition.
+    """
+    toks_user = set(_tokenize(user_text))
+    alias = " ".join([
+        faq_payload.get("name") or "",
+        faq_payload.get("text") or "",
+        faq_payload.get("response") or "",
+    ])
+    toks_faq = set(_tokenize(alias))
+    overlap = len(toks_user.intersection(toks_faq))
+
+    # heuristic shortcuts
+    if re.search(r"\b(difference|mean|meaning|explain|what\s+is)\b", user_text, re.I):
+        return True
+    return overlap >= 1
+
 # -------------------- ARBITER --------------------
 def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> Optional[Dict]:
     if not OPENROUTER_API_KEY:
@@ -416,7 +445,6 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
     compact = _compact_candidates(hits)
     topic_hint = _topic_hint_from_hits(hits)
 
-    # few-shot examples to push the model toward our desired decisions
     examples = (
         "EXAMPLES:\n"
         "User: 'open the first'\n"
@@ -564,19 +592,13 @@ def smart_search(req: SmartSearchReq):
     hits = _prefer_role(hits, req.role)
     return hits[:req.limit]
 
-# ---------- consolidated query after clarify ----------
+# ---------- consolidated query ----------
 def _consolidated_query(req: AssistReq) -> Optional[str]:
-    """
-    Build a short synthetic query using the last assistant clarify + the last two user turns.
-    This boosts the right candidate after the user has already clarified.
-    """
     if not req.history:
         return None
-
     last_user = None
     prev_user = None
     last_assistant_clarify = None
-
     for m in reversed(req.history[-6:]):
         role = m.get("role")
         content = m.get("content", "")
@@ -588,19 +610,12 @@ def _consolidated_query(req: AssistReq) -> Optional[str]:
             prev_user = content
         if last_user and prev_user and last_assistant_clarify:
             break
-
     if not last_user:
         return None
-
     parts = [p for p in (prev_user, last_assistant_clarify, last_user) if p]
     return " | ".join(parts) if parts else None
 
-# ---------- history snippet even when there was NO clarify ----------
 def _history_snippet(req: AssistReq, max_chars: int = 240) -> str:
-    """
-    Join the last few user+assistant turns to give retrieval more context
-    even if there wasn't a clarification in the previous turn.
-    """
     if not req.history:
         return ""
     window = []
@@ -616,40 +631,30 @@ def _history_snippet(req: AssistReq, max_chars: int = 240) -> str:
 def assist(req: AssistReq):
     try:
         hits: List[Dict] = []
-        intent_hint = _intent_hint_from_text(req.text)        # decide intent ONCE
+        intent_hint = _intent_hint_from_text(req.text)
         prev_was_clarify = _previous_turn_was_clarify(req.history)
 
-        # 0) Prior-candidate fast path — but don't navigate if it's a question
+        # 0) Try prior candidates (but don't navigate if question-like)
         picked_from_prior = None
         if req.prior_candidates:
             picked_from_prior = _select_from_prior(req.prior_candidates, req.text)
             if picked_from_prior:
-                if intent_hint == "question" and (picked_from_prior.get("kind") or "nav") == "nav":
-                    # ignore nav pick for a question; continue to normal flow
+                if intent_hint in {"question", "question_nav"} and (picked_from_prior.get("kind") or "nav") == "nav":
                     req.prior_candidates = None
                 else:
                     if (picked_from_prior.get("kind") or "nav") == "nav" and picked_from_prior.get("route"):
-                        resp = {
-                            "mode": "navigate",
-                            "message": f"Taking you to {picked_from_prior.get('name')}.",
-                            "route": picked_from_prior.get("route"),
-                            "picked": picked_from_prior,
-                            "candidates": req.prior_candidates,
-                        }
+                        resp = {"mode": "navigate","message": f"Taking you to {picked_from_prior.get('name')}.",
+                                "route": picked_from_prior.get("route"),"picked": picked_from_prior,
+                                "candidates": req.prior_candidates}
                         if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "prior_nav", "version": VERSION}
                         return resp
                     if (picked_from_prior.get("kind") or "faq") == "faq" and picked_from_prior.get("response"):
-                        resp = {
-                            "mode": "answer",
-                            "message": picked_from_prior.get("response"),
-                            "route": None,
-                            "picked": picked_from_prior,
-                            "candidates": req.prior_candidates,
-                        }
+                        resp = {"mode": "answer","message": picked_from_prior.get("response"),"route": None,
+                                "picked": picked_from_prior,"candidates": req.prior_candidates}
                         if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "prior_faq", "version": VERSION}
                         return resp
 
-        # 1) Use prior list if provided; else fresh search
+        # 1) Build hits
         if req.prior_candidates and not picked_from_prior:
             hits = []
             for h in req.prior_candidates[: req.limit]:
@@ -659,7 +664,6 @@ def assist(req: AssistReq):
                 req.prior_candidates = None
 
         if not req.prior_candidates:
-            # Include history signal even if there wasn't a clarify last turn
             use_text = req.text
             hist = _history_snippet(req)
             if hist:
@@ -680,45 +684,74 @@ def assist(req: AssistReq):
             hits = _prefer_role(hits, req.role)
             hits = hits[: req.limit]
 
-        # 2) Nothing found → generic clarify
+        # 2) Nothing found
         if not hits:
-            resp = {
-                "mode": "clarify",
-                "message": "I couldn’t match that. Do you want to open a page or ask a question about orders?",
-                "route": None,
-                "picked": None,
-                "candidates": hits,
-                "options": [],
-            }
+            resp = {"mode": "clarify","message": "I couldn’t match that. Do you want to open a page or ask a question about orders?",
+                    "route": None,"picked": None,"candidates": hits,"options": []}
             if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "no_hits", "version": VERSION}
             return resp
 
-        # A) If user reply names an option (or index), pick it immediately
+        # A) Direct reply pick
         picked_idx_from_reply = _pick_by_reply_text(req.text, hits)
         if picked_idx_from_reply is not None:
             p = hits[picked_idx_from_reply]["payload"]
-            if (p.get("kind") or "nav") == "nav" and p.get("route") and intent_hint != "question":
-                resp = {"mode": "navigate", "message": f"Taking you to {p.get('name')}.",
-                        "route": p["route"], "picked": p, "candidates": hits}
+            if (p.get("kind") or "nav") == "nav" and p.get("route") and intent_hint not in {"question"}:
+                resp = {"mode": "navigate","message": f"Taking you to {p.get('name')}.",
+                        "route": p["route"],"picked": p,"candidates": hits}
                 if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "reply_pick_nav", "version": VERSION}
                 return resp
             if (p.get("kind") or "faq") == "faq" and p.get("response"):
-                resp = {"mode": "answer", "message": p["response"], "route": None, "picked": p, "candidates": hits}
+                resp = {"mode": "answer","message": p["response"],"route": None,"picked": p,"candidates": hits}
                 if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "reply_pick_faq", "version": VERSION}
                 return resp
 
-        # B) steer questions away from navigation
-        if intent_hint == "question":
-            faq_hits = [h for h in hits if (h["payload"].get("kind") or "nav").lower() == "faq"]
-            if faq_hits and faq_hits[0]["payload"].get("response"):
-                p = faq_hits[0]["payload"]
-                resp = {"mode": "answer", "message": p["response"], "route": None, "picked": p, "candidates": hits}
-                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_faq", "version": VERSION}
+        # --- compute best FAQ vs NAV for guarded decisions ---
+        faq_scored = [(h["score"], h) for h in hits if (h["payload"].get("kind") or "nav").lower() == "faq"]
+        nav_scored = [(h["score"], h) for h in hits if (h["payload"].get("kind") or "nav").lower() == "nav"]
+        faq_scored.sort(key=lambda x: x[0], reverse=True)
+        nav_scored.sort(key=lambda x: x[0], reverse=True)
+        top_faq = faq_scored[0][1] if faq_scored else None
+        top_faq_score = faq_scored[0][0] if faq_scored else -1.0
+        top_nav = nav_scored[0][1] if nav_scored else None
+        top_nav_score = nav_scored[0][0] if nav_scored else -1.0
+
+        # B) If question explicitly about navigation, allow navigation/clarify
+        if intent_hint == "question_nav":
+            if top_nav and top_nav["payload"].get("route"):
+                # role conflict? clarify instead of opening the wrong role page
+                req_role = (req.role or "").lower().strip() or "any"
+                cand_role = (top_nav["payload"].get("role") or "").lower().strip() or "any"
+                if req_role != "any" and cand_role != "any" and req_role != cand_role:
+                    clar = _clarify_from_hits(hits)
+                    msg = f"That page looks like it’s for {cand_role} accounts. Do you want {top_nav['payload'].get('name')} or {_human_join([o['name'] for o in clar['options'][1:3] if o.get('name')])}?"
+                    resp = {"mode": "clarify","message": msg,"route": None,"picked": None,"candidates": hits,"options": clar["options"]}
+                    if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "role_conflict_nav_q", "version": VERSION}
+                    return resp
+                resp = {"mode": "navigate","message": f"Taking you to {top_nav['payload'].get('name')}.",
+                        "route": top_nav["payload"]["route"],"picked": top_nav["payload"],"candidates": hits}
+                if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_nav_to_nav", "version": VERSION}
                 return resp
+            # if no nav at all, fall through to clarify
             clar = _clarify_from_hits(hits)
-            resp = {"mode": "clarify", "message": clar["message"], "route": None,
-                    "picked": None, "candidates": hits, "options": clar["options"]}
-            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_clarify", "version": VERSION}
+            resp = {"mode": "clarify","message": clar["message"],"route": None,"picked": None,"candidates": hits,"options": clar["options"]}
+            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_nav_clarify", "version": VERSION}
+            return resp
+
+        # C) If general question: answer with FAQ only if clearly relevant and strong
+        if intent_hint == "question":
+            if top_faq and top_faq["payload"].get("response"):
+                strong_enough = (top_faq_score >= max(0.78, (hits[0]["score"] - 0.02)))
+                beats_nav_by = (top_faq_score - top_nav_score) if top_nav_score >= 0 else 0.10
+                relevant = _faq_is_relevant(req.text, top_faq["payload"])
+                if strong_enough and beats_nav_by >= 0.04 and relevant:
+                    p = top_faq["payload"]
+                    resp = {"mode": "answer","message": p["response"],"route": None,"picked": p,"candidates": hits}
+                    if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_faq_guarded", "scores": {"faq": top_faq_score, "nav": top_nav_score}, "version": VERSION}
+                    return resp
+            # otherwise clarify (don’t auto-open nav for generic questions)
+            clar = _clarify_from_hits(hits)
+            resp = {"mode": "clarify","message": clar["message"],"route": None,"picked": None,"candidates": hits,"options": clar["options"]}
+            if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_clarify_guarded", "scores": {"faq": top_faq_score, "nav": top_nav_score}, "version": VERSION}
             return resp
 
         # 2.5) Single-survivor auto-resolve (non-question only)
@@ -728,17 +761,17 @@ def assist(req: AssistReq):
         if len(filtered) == 1:
             p = filtered[0]["payload"]
             if (p.get("kind") or "nav") == "nav" and p.get("route"):
-                resp = {"mode": "navigate", "message": f"Taking you to {p.get('name')}.",
-                        "route": p["route"], "picked": p, "candidates": hits}
+                resp = {"mode": "navigate","message": f"Taking you to {p.get('name')}.",
+                        "route": p["route"],"picked": p,"candidates": hits}
                 if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "single_nav", "version": VERSION}
                 return resp
             if (p.get("kind") or "faq") == "faq" and p.get("response"):
-                resp = {"mode": "answer", "message": p.get("response"),
-                        "route": None, "picked": p, "candidates": hits}
+                resp = {"mode": "answer","message": p.get("response"),
+                        "route": None,"picked": p,"candidates": hits}
                 if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "single_faq", "version": VERSION}
                 return resp
 
-        # 3) Ambiguity check
+        # 3) Ambiguity → arbiter (block nav for questions handled earlier)
         eff_threshold = req.threshold
         if req.history:
             eff_threshold = max(0.70, req.threshold - 0.06)
@@ -746,15 +779,13 @@ def assist(req: AssistReq):
                 eff_threshold = max(0.60, eff_threshold - 0.10)
         need_arbiter = req.force_arbiter or _ambiguous(hits, eff_threshold)
 
-        # 3.5) Arbiter (avoid clarify loops; also block nav if it's a question)
         if need_arbiter and not prev_was_clarify:
             arb = call_arbiter(req.text, hits, context=req.context, history=req.history)
             if arb:
                 names = [h["payload"].get("name") for h in hits if h["payload"].get("name")]
                 if arb.get("mode") == "clarify" and _too_generic(arb.get("message"), names):
                     clar = _clarify_from_hits(hits)
-                    resp = {"mode": "clarify", "message": clar["message"], "route": None,
-                            "picked": None, "candidates": hits, "options": clar["options"]}
+                    resp = {"mode": "clarify","message": clar["message"],"route": None,"picked": None,"candidates": hits,"options": clar["options"]}
                     if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "arbiter_generic", "version": VERSION}
                     return resp
 
@@ -765,11 +796,9 @@ def assist(req: AssistReq):
                         picked = hits[idx]["payload"]
                 route = arb.get("route") or (picked and picked.get("route"))
 
-                # hard block: don't navigate on questions
-                if intent_hint == "question" and arb.get("mode") == "navigate":
+                if intent_hint in {"question", "question_nav"} and arb.get("mode") == "navigate":
                     clar = _clarify_from_hits(hits)
-                    resp = {"mode": "clarify", "message": clar["message"], "route": None,
-                            "picked": None, "candidates": hits, "options": clar["options"]}
+                    resp = {"mode": "clarify","message": clar["message"],"route": None,"picked": None,"candidates": hits,"options": clar["options"]}
                     if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "arbiter_nav_blocked", "version": VERSION}
                     return resp
 
@@ -782,30 +811,30 @@ def assist(req: AssistReq):
                     resp.setdefault("options", clar["options"])
                 return resp
 
-        # If previous turn was clarify and we're still here, be decisive
+        # Post-clarify decisiveness
         if prev_was_clarify:
             top = hits[0]["payload"]
             if (top.get("kind") or "nav") == "nav" and top.get("route"):
-                resp = {"mode": "navigate", "message": f"Taking you to {top.get('name')}.",
-                        "route": top.get("route"), "picked": top, "candidates": hits}
+                resp = {"mode": "navigate","message": f"Taking you to {top.get('name')}.",
+                        "route": top.get("route"),"picked": top,"candidates": hits}
                 if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "post_clarify_nav", "version": VERSION}
                 return resp
             if (top.get("kind") or "faq") == "faq" and top.get("response"):
-                resp = {"mode": "answer", "message": top.get("response"),
-                        "route": None, "picked": top, "candidates": hits}
+                resp = {"mode": "answer","message": top.get("response"),
+                        "route": None,"picked": top,"candidates": hits}
                 if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "post_clarify_faq", "version": VERSION}
                 return resp
 
         # 4) Default deterministic pick (non-question only)
         top = hits[0]["payload"]
-        if (top.get("kind") or "nav") == "nav" and top.get("route") and intent_hint != "question":
-            resp = {"mode": "navigate", "message": f"Taking you to {top.get('name')}.",
-                    "route": top.get("route"), "picked": top, "candidates": hits}
+        if (top.get("kind") or "nav") == "nav" and top.get("route") and intent_hint not in {"question", "question_nav"}:
+            resp = {"mode": "navigate","message": f"Taking you to {top.get('name')}.",
+                    "route": top.get("route"),"picked": top,"candidates": hits}
             if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "deterministic_nav", "version": VERSION}
             return resp
         if (top.get("kind") or "faq") == "faq" and top.get("response"):
-            resp = {"mode": "answer", "message": top.get("response"),
-                    "route": None, "picked": top, "candidates": hits}
+            resp = {"mode": "answer","message": top.get("response"),
+                    "route": None,"picked": top,"candidates": hits}
             if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "deterministic_faq", "version": VERSION}
             return resp
 
@@ -862,9 +891,11 @@ def startup_seed():
                 "show new customer orders",
                 "what new orders are available",
                 "orders I can accept",
+                "where do I go for new orders",
+                "which page has new orders",
             ],
         },
-        # ---- helpful FAQ so questions get answered instead of navigating
+        # FAQ for definitions (guarded by _faq_is_relevant)
         {
             "name": "What do Pending vs Accepted mean?",
             "role": "customer",
