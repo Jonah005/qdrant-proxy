@@ -467,7 +467,8 @@ def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = Non
 # -------------------- ENDPOINTS --------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "qdrant-proxy", "routes": [r.path for r in app.routes]}
+    return {"ok": True, "service": "qdrant-proxy"}
+
 
 @app.get("/health")
 def health():
