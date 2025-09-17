@@ -20,7 +20,7 @@ ARBITER_MODEL = os.getenv(
     "mistralai/mistral-small-3.2-24b-instruct:free",
 ).strip()
 
-VERSION = "assist-qa-guard-2025-09-17c"
+VERSION = "assist-qa-guard-2025-09-17d"
 
 # -------------------- CLIENTS / APP --------------------
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -389,15 +389,28 @@ def _previous_turn_was_clarify(history: Optional[List[Dict[str, str]]]) -> bool:
 def _tokenize(s: str) -> List[str]:
     return [t for t in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(t) >= 3]
 
+# ---- stopwords for FAQ relevance ----
+_STOP_TOKENS = {
+    "what","is","are","this","that","these","those",
+    "the","a","an","of","for","to","and","or","vs","vs.",
+    "mean","meaning","difference","explain","about","part","section","page",
+    "new","old","please","kind","type","does","do","how","why","where","which","who"
+}
+
+def _filter_tokens(tokens: List[str]) -> List[str]:
+    return [t for t in tokens if t not in _STOP_TOKENS and len(t) >= 3]
+
 def _pick_by_reply_text(text: Optional[str], hits: List[Dict]) -> Optional[int]:
     if not text or not hits:
         return None
     t = (text or "").lower().strip()
+    # by index/ordinal
     for word in re.findall(r"[a-z0-9]+", t):
         if word in _ORDINAL_MAP:
             idx = _ORDINAL_MAP[word]
             if 0 <= idx < len(hits):
                 return idx
+    # by name/alias overlap
     scores = []
     for i, h in enumerate(hits):
         p = h["payload"]
@@ -417,25 +430,21 @@ def _pick_by_reply_text(text: Optional[str], hits: List[Dict]) -> Optional[int]:
         return best_idx
     return None
 
-# ---------- FAQ relevance guard ----------
+# ---------- FAQ relevance guard (STRICT) ----------
 def _faq_is_relevant(user_text: str, faq_payload: Dict) -> bool:
     """
-    Only let an FAQ auto-answer if the user text overlaps with the FAQ topic.
-    Very light lexical guard to avoid answering unrelated 'where' questions with a definition.
+    Only let an FAQ auto-answer if the user's text shares at least ONE
+    meaningful (non-stopword) token with the FAQ's topic.
+    Prevents generic 'what is ...' from matching unrelated FAQs.
     """
-    toks_user = set(_tokenize(user_text))
-    alias = " ".join([
+    user_tokens = set(_filter_tokens(_tokenize(user_text)))
+    faq_blob = " ".join([
         faq_payload.get("name") or "",
         faq_payload.get("text") or "",
         faq_payload.get("response") or "",
     ])
-    toks_faq = set(_tokenize(alias))
-    overlap = len(toks_user.intersection(toks_faq))
-
-    # heuristic shortcuts
-    if re.search(r"\b(difference|mean|meaning|explain|what\s+is)\b", user_text, re.I):
-        return True
-    return overlap >= 1
+    faq_tokens = set(_filter_tokens(_tokenize(faq_blob)))
+    return len(user_tokens.intersection(faq_tokens)) >= 1
 
 # -------------------- ARBITER --------------------
 def call_arbiter(user_query: str, hits: List[Dict], context: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> Optional[Dict]:
@@ -743,7 +752,7 @@ def assist(req: AssistReq):
                 strong_enough = (top_faq_score >= max(0.78, (hits[0]["score"] - 0.02)))
                 beats_nav_by = (top_faq_score - top_nav_score) if top_nav_score >= 0 else 0.10
                 relevant = _faq_is_relevant(req.text, top_faq["payload"])
-                if strong_enough and beats_nav_by >= 0.04 and relevant:
+                if strong_enough and beats_nav_by >= 0.06 and relevant:
                     p = top_faq["payload"]
                     resp = {"mode": "answer","message": p["response"],"route": None,"picked": p,"candidates": hits}
                     if req.debug: resp["debug"] = {"intent_hint": intent_hint, "path": "question_faq_guarded", "scores": {"faq": top_faq_score, "nav": top_nav_score}, "version": VERSION}
